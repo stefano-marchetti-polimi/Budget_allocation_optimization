@@ -1,31 +1,6 @@
 from pathlib import Path
 from pygeoflood import pyGeoFlood
 
-"""### Download example data if necessary
-Resulting directory structure and file sizes:
-```
-data
-├── aoi_coastline.geojson [5.7M]
-└── houston_example_DEM_30m.tif [121M]
-
-"""
-
-# Commented out IPython magic to ensure Python compatibility.
-# %%bash
-# 
-# # places input datasets in data directory whether or not it exists
-# if [ -d "data" ]; then
-#   cd data
-#   curl -sL https://utexas.box.com/shared/static/sx0n3rncb191nuwokqjpmu14yo38pw61.tgz | tar --strip-components=1 -xzvf -
-# else
-#   curl -sL https://utexas.box.com/shared/static/sx0n3rncb191nuwokqjpmu14yo38pw61.tgz | tar -xzvf -
-# fi
-#
-
-"""### Instantiate **pygeoflood** model class
-
-"""
-
 pgf = pyGeoFlood(dem_path="data/houston_example_DEM_30m.tif")
 
 """### Show DEM with ocean pixel location"""
