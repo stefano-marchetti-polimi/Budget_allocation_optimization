@@ -19,31 +19,16 @@ def fragility_substation(depth):
     """
     Calculate the probability of failure of a substation based on the depth of the water.
     """
-    # Parameters for the lognormal distribution
-    mu = 1  # mean of the underlying normal distribution
-    sigma = 0.2  # standard deviation of the underlying normal distribution
-    # Calculate the probability of failure using the lognormal CDF
-    prob_failure = stats.lognorm.cdf(depth, s=sigma, scale=np.exp(mu))
-    return prob_failure
+    return stats.lognorm.cdf(depth, s=0.2, scale=np.exp(1.09))
 
 def fragility_compressor(depth):
     """
     Calculate the probability of failure of a compressor based on the depth of the water.
     """
-    # Parameters for the lognormal distribution
-    mu = 1  # mean of the underlying normal distribution
-    sigma = 0.2  # standard deviation of the underlying normal distribution
-    # Calculate the probability of failure using the lognormal CDF
-    prob_failure = stats.lognorm.cdf(depth, s=sigma, scale=np.exp(mu))
-    return prob_failure
+    return stats.lognorm.cdf(depth, s=0.2, scale=np.exp(1.09))
 
 def fragility_thermal_unit(depth):
     """
     Calculate the probability of failure of a thermal unit based on the depth of the water.
     """
-    # Parameters for the lognormal distribution
-    mu = 1  # mean of the underlying normal distribution
-    sigma = 0.2  # standard deviation of the underlying normal distribution
-    # Calculate the probability of failure using the lognormal CDF
-    prob_failure = stats.lognorm.cdf(depth, s=sigma, scale=np.exp(mu))
-    return prob_failure
+    return stats.lognorm.cdf(depth, s=0.3, scale=np.exp(1.609))

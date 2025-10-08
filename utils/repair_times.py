@@ -1,4 +1,3 @@
-
 def compressor_repair_time(depth):
     """
     Calculate the time to repair (in hours) of a compressor based on the depth of the water
@@ -16,3 +15,12 @@ def compressor_repair_time(depth):
         return 504
     elif depth >= 1.5:
         return 1008 
+
+def substation_repair_time(depth):
+    return 1
+
+def pv_repair_time(depth):
+    return 1
+
+def thermal_unit_repair_time(depth):
+    return 1
