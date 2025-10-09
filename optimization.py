@@ -1,4 +1,4 @@
-from environment_placeholder import TrialEnv
+from utils.environment_placeholder import TrialEnv
 from stable_baselines3 import PPO
 import numpy as np
 
