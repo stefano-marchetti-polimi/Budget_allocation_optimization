@@ -28,7 +28,8 @@ def compressor_repair_time(depth):
 def substation_repair_time(depth):
     """
     Calculate the time to repair (in hours) of a substationbased on the depth of the water
-    from "M. Movahednia, A. Kargarian, “Flood-aware Optimal Power Flow for Proactive Day-ahead Transmission Substation Hardening,” CoRR, vol. abs/2201.03162, Jan. 2022"
+    from "M. Movahednia, A. Kargarian, “Flood-aware Optimal Power Flow for Proactive Day-ahead Transmission Substation Hardening,” 
+    CoRR, vol. abs/2201.03162, Jan. 2022"
     """
     if depth <= 0:
         return 0.0
