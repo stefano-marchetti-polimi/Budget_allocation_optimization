@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.stats import genpareto
 import matplotlib.pyplot as plt
+import pandas as pd
 from fragility_curves import fragility_PV, fragility_substation, fragility_compressor, fragility_thermal_unit, fragility_LNG_terminal
 import time
 
@@ -10,34 +11,106 @@ kH = 0.8019
 sH = 0.1959
 N = 10**6
 n_bins = 50
-threhsold = 0
+threshold = 0
+threshold_depth = 0
+
+maximum_depth = 8
 
 # Plot toggle 
-DO_PLOT = False
+DO_PLOT = True
 
 t_start = time.perf_counter()
 
 # Create GPD distribution object
 gpd = genpareto(c=kH, scale=sH, loc=0)
 
-# Sample flood heights (exceedances + threshold) and reject > 4 m by resampling
+# Sample flood heights (exceedances + threshold) and reject > depth threshold by resampling
 samples = gpd.rvs(size=N)
-mask = samples > 4.0
+mask = samples > maximum_depth
 while np.any(mask):
     samples[mask] = gpd.rvs(size=int(np.sum(mask)))
-    mask = samples > 4.0
+    mask = samples > maximum_depth
 
-samples += threhsold
+samples += threshold_depth
 
-# Fragilities per component (no spatial variability; all use common samples)
-PV_fragility = fragility_PV(samples)
-substation1_fragility = fragility_substation(samples)
-substation2_fragility = fragility_substation(samples)
-compressor1_fragility = fragility_compressor(samples)
-compressor2_fragility = fragility_compressor(samples)
-compressor3_fragility = fragility_compressor(samples)
-thermal_unit_fragility = fragility_thermal_unit(samples)
-LNG_terminal_fragility = fragility_LNG_terminal(samples)
+
+CSV_PATH = 'outputs/coastal_inundation_samples.csv'  # tab/CSV with row index P1..P8 and numeric columns
+
+# Auto-detect delimiter, use first column as index (P1..P8), first row as header (numeric inputs)
+# Allow for comma- or tab-separated files.
+df_raw = pd.read_csv(CSV_PATH, sep=None, engine='python', header=0, index_col=0)
+
+# Ensure column names are floats (input hazard levels) and values are floats
+df_raw.columns = [float(c) for c in df_raw.columns]
+df = df_raw.apply(pd.to_numeric, errors='coerce')
+
+# Sorted vector of input values (columns) for nearest-neighbour lookup
+input_grid = np.array(sorted(df.columns))
+
+# Map each network component to the corresponding point row in the CSV.
+# Adjust these if your components correspond to different points.
+ROW_FOR_COMPONENT = {
+    'PV': 'P1',
+    'Substation1': 'P2',
+    'Substation2': 'P3',
+    'Compressor1': 'P4',
+    'Compressor2': 'P5',
+    'Compressor3': 'P6',
+    'ThermalUnit': 'P7',
+    'LNG': 'P8',
+}
+
+missing_rows = [r for r in ROW_FOR_COMPONENT.values() if r not in df.index]
+if missing_rows:
+    raise KeyError(f"Missing rows in CSV for points: {missing_rows}. Available rows: {list(df.index)}")
+
+
+def lookup_depth_row(row_name: str, query_inputs: np.ndarray) -> np.ndarray:
+    """For each sampled hazard *input* value, find nearest input_grid column and
+    return the corresponding flood depth from the specified CSV row (point).
+    """
+    vals = df.loc[row_name].reindex(input_grid).to_numpy()
+    idx = np.searchsorted(input_grid, query_inputs, side='left')
+    idx_right = np.clip(idx, 0, len(input_grid) - 1)
+    idx_left = np.clip(idx - 1, 0, len(input_grid) - 1)
+
+    choose_left = (idx_right == 0) | (
+        (idx_right < len(input_grid))
+        & (np.abs(query_inputs - input_grid[idx_left]) <= np.abs(query_inputs - input_grid[idx_right]))
+    )
+    nearest_idx = np.where(choose_left, idx_left, idx_right)
+    return vals[nearest_idx]
+
+# === Per-component hazard depths from CSV (nearest to sampled hazard input) ===
+depth_PV    = lookup_depth_row(ROW_FOR_COMPONENT['PV'],          samples)
+depth_sub1  = lookup_depth_row(ROW_FOR_COMPONENT['Substation1'], samples)
+depth_sub2  = lookup_depth_row(ROW_FOR_COMPONENT['Substation2'], samples)
+depth_comp1 = lookup_depth_row(ROW_FOR_COMPONENT['Compressor1'], samples)
+depth_comp2 = lookup_depth_row(ROW_FOR_COMPONENT['Compressor2'], samples)
+depth_comp3 = lookup_depth_row(ROW_FOR_COMPONENT['Compressor3'], samples)
+depth_therm = lookup_depth_row(ROW_FOR_COMPONENT['ThermalUnit'], samples)
+depth_LNG   = lookup_depth_row(ROW_FOR_COMPONENT['LNG'],         samples)
+
+print("Loaded inundation CSV: rows=points", list(df.index), "columns (inputs)=", input_grid.tolist())
+print("Depth ranges (m):",
+      f"PV[{depth_PV.min():.3f},{depth_PV.max():.3f}]",
+      f"Sub1[{depth_sub1.min():.3f},{depth_sub1.max():.3f}]",
+      f"Sub2[{depth_sub2.min():.3f},{depth_sub2.max():.3f}]",
+      f"C1[{depth_comp1.min():.3f},{depth_comp1.max():.3f}]",
+      f"C2[{depth_comp2.min():.3f},{depth_comp2.max():.3f}]",
+      f"C3[{depth_comp3.min():.3f},{depth_comp3.max():.3f}]",
+      f"Therm[{depth_therm.min():.3f},{depth_therm.max():.3f}]",
+      f"LNG[{depth_LNG.min():.3f},{depth_LNG.max():.3f}]")
+
+# === Convert depths to fragilities via component-specific curves ===
+PV_fragility = np.clip(fragility_PV(depth_PV), 0.0, 1.0)
+substation1_fragility = np.clip(fragility_substation(depth_sub1), 0.0, 1.0)
+substation2_fragility = np.clip(fragility_substation(depth_sub2), 0.0, 1.0)
+compressor1_fragility = np.clip(fragility_compressor(depth_comp1), 0.0, 1.0)
+compressor2_fragility = np.clip(fragility_compressor(depth_comp2), 0.0, 1.0)
+compressor3_fragility = np.clip(fragility_compressor(depth_comp3), 0.0, 1.0)
+thermal_unit_fragility = np.clip(fragility_thermal_unit(depth_therm), 0.0, 1.0)
+LNG_terminal_fragility = np.clip(fragility_LNG_terminal(depth_LNG), 0.0, 1.0)
 
 if DO_PLOT:
     # Create figure with 5 subplots arranged in a 3x2 grid (last subplot empty)
@@ -51,32 +124,32 @@ if DO_PLOT:
     axs[0].set_title('Histogram of Flood Heights')
     axs[0].legend()
 
-    # Plot each fragility histogram separately
-    axs[1].hist(PV_fragility, bins=n_bins, density=True, alpha=0.6, color='#e15759', label='PV Fragility')
+    # Plot each fragility histogram separately, excluding zeros by threshold
+    axs[1].hist(PV_fragility[PV_fragility > threshold], bins=n_bins, density=True, alpha=0.6, color='#e15759', label='PV Fragility')
     axs[1].set_xlabel('Fragility')
     axs[1].set_ylabel('Density')
     axs[1].set_title('PV Fragility Distribution')
     axs[1].legend()
 
-    axs[2].hist(np.concatenate([substation1_fragility, substation2_fragility]), bins=n_bins, density=True, alpha=0.6, color='#59a14f', label='Substation Fragility')
+    axs[2].hist(np.concatenate([substation1_fragility[substation1_fragility > threshold], substation2_fragility[substation2_fragility > threshold]]), bins=n_bins, density=True, alpha=0.6, color='#59a14f', label='Substation Fragility')
     axs[2].set_xlabel('Fragility')
     axs[2].set_ylabel('Density')
     axs[2].set_title('Substation Fragility Distribution')
     axs[2].legend()
 
-    axs[3].hist(np.concatenate([compressor1_fragility, compressor2_fragility, compressor3_fragility]), bins=n_bins, density=True, alpha=0.6, color='#f28e2b', label='Compressor Fragility')
+    axs[3].hist(np.concatenate([compressor1_fragility[compressor1_fragility > threshold], compressor2_fragility[compressor2_fragility > threshold], compressor3_fragility[compressor3_fragility > threshold]]), bins=n_bins, density=True, alpha=0.6, color='#f28e2b', label='Compressor Fragility')
     axs[3].set_xlabel('Fragility')
     axs[3].set_ylabel('Density')
     axs[3].set_title('Compressor Fragility Distribution')
     axs[3].legend()
 
-    axs[4].hist(thermal_unit_fragility, bins=n_bins, density=True, alpha=0.6, color='#9467bd', label='Thermal Unit Fragility')
+    axs[4].hist(thermal_unit_fragility[thermal_unit_fragility > threshold], bins=n_bins, density=True, alpha=0.6, color='#9467bd', label='Thermal Unit Fragility')
     axs[4].set_xlabel('Fragility')
     axs[4].set_ylabel('Density')
     axs[4].set_title('Thermal Unit Fragility Distribution')
     axs[4].legend()
 
-    axs[5].hist(LNG_terminal_fragility, bins=n_bins, density=True, alpha=0.6, color='#17becf', label='LNG terminal Fragility')
+    axs[5].hist(LNG_terminal_fragility[LNG_terminal_fragility > threshold], bins=n_bins, density=True, alpha=0.6, color='#17becf', label='LNG terminal Fragility')
     axs[5].set_xlabel('Fragility')
     axs[5].set_ylabel('Density')
     axs[5].set_title('LNG terminal Fragility Distribution')
@@ -138,9 +211,9 @@ sub2_service = sub2_b & PV_service
 # THIS HAS BEEN ADDED TO ADD VARIABILITY
 # Independent feeder availability from each substation to each compressor (decouple services)
 # Slightly different reliability per compressor feeders
-p_feeder_avail_c1 = 0.77
-p_feeder_avail_c2 = 0.95
-p_feeder_avail_c3 = 0.84
+p_feeder_avail_c1 = 0.8
+p_feeder_avail_c2 = 0.8
+p_feeder_avail_c3 = 0.8
 rng_feeder = np.random.default_rng()
 
 # For compressor 1
