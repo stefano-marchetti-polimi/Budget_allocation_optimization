@@ -12,9 +12,8 @@ N = 10**6
 n_bins = 50
 threhsold = 0
 
-# Plot toggle and spatial variability (meters)
+# Plot toggle 
 DO_PLOT = False
-spatial_sigma = 0.25  # std dev of spatial depth variability per component (m)
 
 t_start = time.perf_counter()
 
@@ -30,35 +29,15 @@ while np.any(mask):
 
 samples += threhsold
 
-# Add spatial variability to depths without clipping (reject out-of-bounds and resample noise)
-def add_spatial_variability(base_depths, sigma, rng):
-    depths = base_depths + rng.normal(0.0, sigma, size=base_depths.shape)
-    mask = (depths < 0.0) | (depths > 4.0)
-    while np.any(mask):
-        depths[mask] = base_depths[mask] + rng.normal(0.0, sigma, size=int(np.sum(mask)))
-        mask = (depths < 0.0) | (depths > 4.0)
-    return depths
-
-# Component-specific depths with spatial variability
-rng = np.random.default_rng()
-samples_PV   = add_spatial_variability(samples, spatial_sigma, rng)
-samples_sub1 = add_spatial_variability(samples, spatial_sigma, rng)
-samples_sub2 = add_spatial_variability(samples, spatial_sigma, rng)
-samples_c1   = add_spatial_variability(samples, spatial_sigma, rng)
-samples_c2   = add_spatial_variability(samples, spatial_sigma, rng)
-samples_c3   = add_spatial_variability(samples, spatial_sigma, rng)
-samples_th   = add_spatial_variability(samples, spatial_sigma, rng)
-samples_lng  = add_spatial_variability(samples, spatial_sigma, rng)
-
-# Fragilities per component
-PV_fragility = fragility_PV(samples_PV)
-substation1_fragility = fragility_substation(samples_sub1)
-substation2_fragility = fragility_substation(samples_sub2)
-compressor1_fragility = fragility_compressor(samples_c1)
-compressor2_fragility = fragility_compressor(samples_c2)
-compressor3_fragility = fragility_compressor(samples_c3)
-thermal_unit_fragility = fragility_thermal_unit(samples_th)
-LNG_terminal_fragility = fragility_LNG_terminal(samples_lng)
+# Fragilities per component (no spatial variability; all use common samples)
+PV_fragility = fragility_PV(samples)
+substation1_fragility = fragility_substation(samples)
+substation2_fragility = fragility_substation(samples)
+compressor1_fragility = fragility_compressor(samples)
+compressor2_fragility = fragility_compressor(samples)
+compressor3_fragility = fragility_compressor(samples)
+thermal_unit_fragility = fragility_thermal_unit(samples)
+LNG_terminal_fragility = fragility_LNG_terminal(samples)
 
 if DO_PLOT:
     # Create figure with 5 subplots arranged in a 3x2 grid (last subplot empty)
@@ -298,22 +277,6 @@ metrics = [
 
 t_end = time.perf_counter()
 print(f"\nTotal runtime: {t_end - t_start:.3f} s")
-
-
-fig_violin, ax_v = plt.subplots(1, 1, figsize=(10, 6))
-viol = ax_v.violinplot(
-    [m[0] for m in metrics],
-    showmeans=True,
-    showmedians=True,
-    showextrema=False,
-)
-ax_v.set_xticks(np.arange(1, len(metrics)+1))
-ax_v.set_xticklabels([m[1] for m in metrics], rotation=20, ha='right')
-ax_v.set_ylabel('Value')
-ax_v.set_title('Distribution comparison (violin plots)')
-ax_v.grid(True, axis='y', alpha=0.3)
-plt.tight_layout()
-plt.show()
 
 # === Histogram comparison for losses, social impacts, and reward ===
 fig_hist, axs_hist = plt.subplots(2, 3, figsize=(14, 8))
