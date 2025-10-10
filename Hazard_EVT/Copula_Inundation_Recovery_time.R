@@ -1,6 +1,6 @@
-# Copula Code
-# By Santiago Taguado & Thomas Coscia
-# October 31st, 2024 
+# Copula Fitting
+# By Santiago Taguado, Stefano Marchetti & Thomas Matteo Coscia
+# October 10th, 2025 
 
 # Libraries
 ########################################################################
@@ -12,13 +12,16 @@ library(corrplot)
 library(VineCopula)
 library(CDVineCopulaConditional) 
 library(NSM3)
+library(truncnorm)
+library(copula)
 
 ###################################################################################
 # Assess data is stationary. In order to assess you can perform tests  such as Petit test.
 ####################################################################################
 
+# Step 1
 ranks = pobs(Moderate_Inundation_Time_Duration$`Maximum Elevation (Meters)`)
-ranks_1 = pobs(Moderate_Inundation_Time_Duration$`Duration (Hours)`+CC_impact)
+ranks_1 = pobs(Moderate_Inundation_Time_Duration$`Duration (Hours)`)
 
 B <- cbind(ranks,ranks_1)
 plot(ranks,ranks_1)
@@ -160,3 +163,76 @@ contour(gumbel_cop_mod,
         lty = 1,                   # Solid line type for Gumbel copula
         lwd = 2,                   # Thicker lines for visibility
         labcex = 1.5)              # Increase the size of contour labels
+
+###################################################################################
+# Step 7: Climate Change Impact
+set.seed(42)
+
+# Use first 24 rows (adjust as needed)
+idx <- seq_len(24)
+dat <- Moderate_Inundation_Time_Duration[idx, ]
+
+fit_for_mean <- function(mu, sd = 0.01) {
+  # 1) CC impact (truncated normal > 0), same length as dat
+  CC_impact <- rtruncnorm(n = nrow(dat), a = 0, mean = mu, sd = sd)
+  
+  # 2) Adjusted inundation heights: Elevation + impact (NOT duration)
+  CC_height <- dat$`Maximum Elevation (Meters)` + CC_impact
+  
+  # 3) Pseudo-observations
+  ranks   <- pobs(CC_height)
+  ranks_1 <- pobs(dat$`Duration (Hours)`)
+  U <- cbind(ranks, ranks_1)
+  
+  # 4) Gumbel copula fit (θ >= 1)
+  gumbel_cop <- fitCopula(gumbelCopula(dim = 2), U, method = "ml")
+  
+  # 5) Coefficients from summary()  <-- use $coef (list)
+  sm <- summary(gumbel_cop)
+  coef_mat <- sm$coef  # matrix with columns: Estimate, Std. Error, z value, Pr(>|z|)
+  
+  # Tidy coefficients table (add mu and parameter name)
+  coef_df <- data.frame(
+    mean      = mu,
+    param     = rownames(coef_mat),
+    Estimate  = coef_mat[, "Estimate"],
+    Std.Error = coef_mat[, "Std. Error"],
+    z.value   = if ("z value" %in% colnames(coef_mat)) coef_mat[, "z value"] else NA_real_,
+    Pr_gt_z   = if ("Pr(>|z|)" %in% colnames(coef_mat)) coef_mat[, "Pr(>|z|)"] else NA_real_,
+    row.names = NULL
+  )
+  
+  # Estimate & variance (variance = SE^2)
+  theta_hat <- coef_df$Estimate[1]
+  var_hat   <- coef_df$Std.Error[1]^2
+  
+  # Print per run
+  cat(sprintf("mu = %.2f -> estimate = %.6f, variance = %.6f\n",
+              mu, theta_hat, var_hat))
+  print(coef_df); cat("\n")
+  
+  list(
+    mean     = mu,
+    estimate = theta_hat,
+    variance = var_hat,
+    coef_df  = coef_df
+  )
+}
+
+means <- c(0.05, 0.10, 0.15, 0.20, 0.25)
+
+# Run and collect
+results_list <- lapply(means, fit_for_mean)
+
+# Summary tables
+gumbel_est_var <- do.call(rbind, lapply(results_list, \(x)
+                                        data.frame(mean = x$mean, estimate = x$estimate, variance = x$variance)))
+
+gumbel_coefs <- do.call(rbind, lapply(results_list, `[[`, "coef_df"))
+
+# Final prints
+cat("=== Estimate & Variance per mu ===\n")
+print(gumbel_est_var, row.names = FALSE)
+
+cat("\n=== Full Coefficients (from summary) ===\n")
+print(gumbel_coefs, row.names = FALSE)
