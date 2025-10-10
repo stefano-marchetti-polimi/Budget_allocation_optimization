@@ -20,7 +20,7 @@ grid on; axis tight;
 
 %% === 1) Fit GPD marginals by MLE (independence across events) ===
 % gpfit returns [k (shape), sigma (scale)] and 95% CIs
-[kH,sH,ciH] = deal([]); [kD,sD,ciD] = deal([]);
+
 [paramH,ciH] = gpfit(H);  kH = paramH(1); sH = paramH(2);
 [paramD,ciD] = gpfit(D);  kD = paramD(1); sD = paramD(2);
 
@@ -48,8 +48,8 @@ if kD < 0
     assert(all(D < x_max_D), 'Some D exceed fitted GPD support (k<0).');
 end
 
-[~,~,ksstat_H] = kstest(H, 'CDF', pdH);
-[~,~,ksstat_D] = kstest(D, 'CDF', pdD);
+[h_H,p_H,ksstat_H] = kstest(H, 'CDF', pdH);
+[h_D,p_D,ksstat_D] = kstest(D, 'CDF', pdD);
 
 
 %% === 2) Diagnostics: QQ plots against fitted GPD ===
@@ -95,19 +95,36 @@ histogram(boot_rho, 'Normalization','pdf'); xlabel('Spearman \rho'); ylabel('PDF
 title('Bootstrap dist. of Spearman \rho'); grid on;
 
 %% === 4) Summarize results ===
+
+%decision = ["Fail to reject H0","Reject H0"];          % if h is 0 or 1
 fprintf('\n=== GPD MLE (Height exceedances) ===\n');
 fprintf('k (shape)  = %.4f  [95%% CI: %.4f, %.4f]\n', kH, ciH(1,1), ciH(2,1));
 fprintf('sigma      = %.4f  [95%% CI: %.4f, %.4f]\n', sH, ciH(1,2), ciH(2,2));
-fprintf('AIC = %.2f, BIC = %.2f, KS stat = %.4f\n', AIC_H, BIC_H, ksstat_H);
+fprintf('AIC = %.2f, BIC = %.2f, KS stat = %.4f\n, p-value=%.4f\n, h=%.0f', AIC_H, BIC_H, ksstat_H, p_H, h_H);
 
 fprintf('\n=== GPD MLE (Duration exceedances) ===\n');
 fprintf('k (shape)  = %.4f  [95%% CI: %.4f, %.4f]\n', kD, ciD(1,1), ciD(2,1));
 fprintf('sigma      = %.4f  [95%% CI: %.4f, %.4f]\n', sD, ciD(1,2), ciD(2,2));
-fprintf('AIC = %.2f, BIC = %.2f, KS stat = %.4f\n', AIC_D, BIC_D, ksstat_D);
+fprintf('AIC = %.2f, BIC = %.2f, KS stat = %.4f\n, p-value=%.4f\n, h=%.0f', AIC_D, BIC_D, ksstat_D, p_D, h_D);
 
 fprintf('\n=== Dependence (paired bootstrap %d) ===\n', nboot);
 fprintf('Kendall tau  = %.4f  [95%% CI: %.4f, %.4f]\n', tau_hat, CI_tau(1), CI_tau(2));
 fprintf('Spearman rho = %.4f  [95%% CI: %.4f, %.4f]\n', rho_hat, CI_rho(1), CI_rho(2));
+%% KS test results 
+
+names   = ["H","D"];
+AICs    = [AIC_H, AIC_D];
+BICs    = [BIC_H, BIC_D];
+ksstats = [ksstat_H, ksstat_D];
+pvals   = [p_H, p_D];
+hs      = [h_H, h_D];
+
+decision = ["Fail to reject H0","Reject H0"];
+
+for k = 1:numel(names)
+    fprintf('%s: AIC = %.2f, BIC = %.2f, KS stat = %.4f, p = %.4f, h=%d (%s)\n', ...
+        names(k), AICs(k), BICs(k), ksstats(k), pvals(k), hs(k), decision(hs(k)+1));
+end
 
 %% === 6) Monte Carlo simulation from fitted GPDs + histograms ===
 N = 1000;                 % number of Monte Carlo samples
@@ -135,7 +152,7 @@ nexttile;
 histogram(simH, 'Normalization','pdf', 'EdgeColor','none'); hold on;
 xH = linspace(0, xmaxH, 600);
 plot(xH, gppdf(xH, kH, sH), 'LineWidth', 1.8);
-xlabel('H exceedance'); ylabel('PDF');
+xlabel('Flood height exceeding tr (m)'); ylabel('PDF');
 title(sprintf('Monte Carlo (N = %d): H', N)); grid on; box on;
 legend('MC histogram','Fitted GPD PDF', 'Location','best');
 
@@ -144,7 +161,7 @@ nexttile;
 histogram(simD, 'Normalization','pdf', 'EdgeColor','none'); hold on;
 xD = linspace(0, xmaxD, 600);
 plot(xD, gppdf(xD, kD, sD), 'LineWidth', 1.8);
-xlabel('D exceedance'); ylabel('PDF');
+xlabel('Flood duration (h)'); ylabel('PDF');
 title(sprintf('Monte Carlo (N = %d): D', N)); grid on; box on;
 legend('MC histogram','Fitted GPD PDF', 'Location','best');
 
@@ -172,4 +189,3 @@ fprintf('D: mean(sample)=%.4f,  var(sample)=%.4f,  mean(th)=%.4f, var(th)=%.4f\n
 % zT_H = gpinv(p, kH, sH);   % return levels for H-exceedances over u_H
 % zT_D = gpinv(p, kD, sD);   % return levels for D-exceedances over u_D
 % table(T, zT_H, zT_D)
-
