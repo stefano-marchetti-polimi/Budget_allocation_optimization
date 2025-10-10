@@ -32,3 +32,9 @@ def fragility_thermal_unit(depth):
     Calculate the probability of failure of a thermal unit based on the depth of the water.
     """
     return stats.lognorm.cdf(depth, s=0.3, scale=np.exp(1.609))
+
+def fragility_LNG_terminal(depth):
+    """
+    Calculate the probability of failure of a thermal unit based on the depth of the water.
+    """
+    return stats.lognorm.cdf(depth, s=0.35, scale=np.exp(2.08))
