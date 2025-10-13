@@ -54,50 +54,75 @@ def substation_repair_time(depth):
 
 def thermal_unit_repair_time(depth):
     """
-    Calculate the time to repair (in hours) of a thermal unit (assumed equal to substation)
+    Calculate the time to repair (in hours) of a thermal unit (assumed larger than substation)
     """
     if depth <= 0:
         return 0.0
     if depth < 0.5:
-        mean = 12.3
+        mean = 12.3*1.5
         return np.random.normal(mean, 0.1 * mean)
     elif depth < 0.6:
-        mean = 14.1
+        mean = 14.1*1.5
         return np.random.normal(mean, 0.1 * mean)
     elif depth < 0.8:
-        mean = 17.7
+        mean = 17.7*1.5
         return np.random.normal(mean, 0.1 * mean)
     elif depth < 0.9:
-        mean = 19.4
+        mean = 19.4*1.5
         return np.random.normal(mean, 0.1 * mean)
     elif depth < 1.1:
-        mean = 23.1
+        mean = 23.1*1.5
         return np.random.normal(mean, 0.1 * mean)
     else:
-        mean = 25.0
+        mean = 25.0*1.5
+        return np.random.normal(mean, 0.1 * mean)
+
+def LNG_repair_time(depth):
+    """
+    Calculate the time to repair (in hours) of the LNG terminal (assumed larger than substation)
+    """
+    if depth <= 0:
+        return 0.0
+    if depth < 0.5:
+        mean = 12.3*1.5
+        return np.random.normal(mean, 0.1 * mean)
+    elif depth < 0.6:
+        mean = 14.1*1.5
+        return np.random.normal(mean, 0.1 * mean)
+    elif depth < 0.8:
+        mean = 17.7*1.5
+        return np.random.normal(mean, 0.1 * mean)
+    elif depth < 0.9:
+        mean = 19.4*1.5
+        return np.random.normal(mean, 0.1 * mean)
+    elif depth < 1.1:
+        mean = 23.1*1.5
+        return np.random.normal(mean, 0.1 * mean)
+    else:
+        mean = 25.0*1.5
         return np.random.normal(mean, 0.1 * mean)
 
 def pv_repair_time(depth):
     """
-    Calculate the time to repair (in hours) of a photovoltaic unit (assumed equal to substation)
+    Calculate the time to repair (in hours) of a photovoltaic unit (assumed smaller than substation)
     """
     if depth <= 0:
         return 0.0
     if depth < 0.5:
-        mean = 12.3
+        mean = 12.3*0.8
         return np.random.normal(mean, 0.1 * mean)
     elif depth < 0.6:
-        mean = 14.1
+        mean = 14.1*0.8
         return np.random.normal(mean, 0.1 * mean)
     elif depth < 0.8:
-        mean = 17.7
+        mean = 17.7*0.8
         return np.random.normal(mean, 0.1 * mean)
     elif depth < 0.9:
-        mean = 19.4
+        mean = 19.4*0.8
         return np.random.normal(mean, 0.1 * mean)
     elif depth < 1.1:
-        mean = 23.1
+        mean = 23.1*0.8
         return np.random.normal(mean, 0.1 * mean)
     else:
-        mean = 25.0
+        mean = 25.0*0.8
         return np.random.normal(mean, 0.1 * mean)
