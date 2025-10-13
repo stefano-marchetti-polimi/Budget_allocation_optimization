@@ -11,30 +11,19 @@ from utils.fragility_curves import (
     fragility_thermal_unit,
     fragility_LNG_terminal,
 )
+from utils.repair_times import (compressor_repair_time, substation_repair_time, thermal_unit_repair_time, pv_repair_time, LNG_repair_time)
 
-# OBSERVATION: WALL_HEIGHT
+# NEED TO ADD REPAIR TIMES FOR THE IMPACTS!!!!
 
 class TrialEnv(gym.Env):
     """
     Custom environment for sequential (yearly) investment over a network of nodes.
 
-    Parameters
-    ----------
-    num_nodes : int
-        Number of nodes in the system network.
-    years : int, default=50
-        Number of decision epochs.
-    weights : list of float
-        List of weights for the reward function: [w_gas, w_electricity, w_gas_loss, w_gas_social, w_electricity_loss, w_electricity_social]
-    action_max : float, default=1.0
-        Upper bound for per-node yearly expense in the action space.
+    This variant enforces a **single-improvement** decision at each step: the agent selects exactly one target component (or a no‑investment option), and the **entire yearly budget** is allocated to that target only.
 
-    Notes
-    -----
-    - State keeps a per-node "condition" in [0, 1], where 1 is best.
-    - Expected impacts are (for now) simple linear functions of (1 - condition).
-    - Reward is weight_econ * util_econ(econ_impact) + weight_soc * util_soc(social_impact).
-    - The episode lasts `years` steps. Actions are vectors of expenses, one per node.
+    Action space: `Discrete(N+1)` where 0 = **no investment** (save all budget), and 1..N = invest 100% of the budget in that component.
+
+    Observation normalization (optional): when enabled, the environment returns observations scaled to [0,1].
     """
 
     def __init__(
@@ -54,7 +43,7 @@ class TrialEnv(gym.Env):
         max_depth: float = 8.0,
         threshold_depth: float = 0.5,
         rise_rate : float = 0.03,
-        enforce_budget_normalization: bool = True,
+        normalize_observations: bool = True,
     ):
         super().__init__()
         assert num_nodes >= 1, "num_nodes must be >= 1"
@@ -65,6 +54,7 @@ class TrialEnv(gym.Env):
         self.year_step = int(year_step)
         self.weights = weights
         self.rise_rate = float(rise_rate)
+        self.area = area
         # This environment currently models 8 components explicitly below
         assert num_nodes == 8, "num_nodes must be 8 to match the hardcoded component mapping (PV, 2 substations, 3 compressors, thermal, LNG)."
 
@@ -75,18 +65,30 @@ class TrialEnv(gym.Env):
         self.gpd_sigma = float(gpd_sigma)
         self.max_depth = float(max_depth)
         self.threshold_depth = float(threshold_depth)
-        self.enforce_budget_normalization = bool(enforce_budget_normalization)
 
-        # Action space: per-node yearly expenses as a fraction of the budget (0..1 per node). Total may be normalized to 1 if enforce_budget_normalization=True.
-        self.action_max = float(1)
-        self.action_space = spaces.Box(
-            low=0.0, high=self.action_max, shape=(self.N,), dtype=np.float32
-        )
+        # Constants for cost-to-height conversion (used in step and obs normalization)
+        self.alpha = 4.0   # shape factor (3.5–4.6)
+        self.u0 = 1800.0   # €/m cost at 1 m wall height
+        self.beta = 1.2    # cost-height exponent
+
+        # Normalization toggle
+        self.normalize_observations = bool(normalize_observations)
+
+        # Action space: categorical choice of a single target (or no investment)
+        # 0 = no investment; 1..N = invest all budget in that component
+        self.action_space = spaces.Discrete(self.N + 1)
 
         # Observation: [wall_height (N), current_year (1), econ_impact (1), social_impact (1)]
-        # wall_height is unbounded above in principle, but practically limited by budget; impacts are >= 0, year in [0, T]
-        high_obs = np.array([1.0] * self.N + [float(self.T)] + [np.finfo(np.float32).max] * 2, dtype=np.float32)
-        low_obs = np.zeros(self.N + 3, dtype=np.float32)
+        # Precompute reference wall-height increment for one full-budget step per asset
+        self.h_ref = (self.budget / (self.alpha * self.u0 * np.sqrt(self.area))) ** (1.0 / self.beta)
+        if self.normalize_observations:
+            # All features scaled to [0,1]
+            low_obs = np.zeros(self.N + 3, dtype=np.float32)
+            high_obs = np.ones(self.N + 3, dtype=np.float32)
+        else:
+            # Raw ranges (year in [0, T]; impacts nonnegative; wall heights unbounded above)
+            high_obs = np.array([1] * self.N + [float(self.T)] + [np.finfo(np.float32).max] * 2, dtype=np.float32)
+            low_obs = np.zeros(self.N + 3, dtype=np.float32)
         self.observation_space = spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
 
         # RNG seed / state
@@ -222,6 +224,35 @@ class TrialEnv(gym.Env):
         therm_b = thermal_unit.astype(bool)
         LNG_b   = LNG_terminal_.astype(bool)
 
+        # === Repair times (hours or days depending on the function) ===
+        # Vectorize the repair time functions to accept numpy arrays
+        pv_rt_fn = np.vectorize(pv_repair_time, otypes=[np.float32])
+        sub_rt_fn = np.vectorize(substation_repair_time, otypes=[np.float32])
+        comp_rt_fn = np.vectorize(compressor_repair_time, otypes=[np.float32])
+        therm_rt_fn = np.vectorize(thermal_unit_repair_time, otypes=[np.float32])
+        LNG_rt_fn = np.vectorize(LNG_repair_time, otypes=[np.float32])
+
+        # Sample per-sample repair times only where the component failed; 0 otherwise
+        t_PV    = np.where(~PV_b,    pv_rt_fn(depth_PV),    0.0).astype(np.float32)
+        t_sub1  = np.where(~sub1_b,  sub_rt_fn(depth_sub1), 0.0).astype(np.float32)
+        t_sub2  = np.where(~sub2_b,  sub_rt_fn(depth_sub2), 0.0).astype(np.float32)
+        t_comp1 = np.where(~comp1_b, comp_rt_fn(depth_comp1), 0.0).astype(np.float32)
+        t_comp2 = np.where(~comp2_b, comp_rt_fn(depth_comp2), 0.0).astype(np.float32)
+        t_comp3 = np.where(~comp3_b, comp_rt_fn(depth_comp3), 0.0).astype(np.float32)
+        t_therm = np.where(~therm_b, therm_rt_fn(depth_therm), 0.0).astype(np.float32)
+        t_LNG   = np.where(~LNG_b,   LNG_rt_fn(depth_LNG),   0.0).astype(np.float32)
+
+        # Normalize all repair times by a fixed maximum (e.g., 1200) so they are in [0,1]
+        TIME_NORM = np.float32(1200.0)
+        t_PV    = (t_PV    / (TIME_NORM)).astype(np.float32)
+        t_sub1  = (t_sub1  / (TIME_NORM)).astype(np.float32)
+        t_sub2  = (t_sub2  / (TIME_NORM)).astype(np.float32)
+        t_comp1 = (t_comp1 / (TIME_NORM)).astype(np.float32)
+        t_comp2 = (t_comp2 / (TIME_NORM)).astype(np.float32)
+        t_comp3 = (t_comp3 / (TIME_NORM)).astype(np.float32)
+        t_therm = (t_therm / (TIME_NORM)).astype(np.float32)
+        t_LNG   = (t_LNG   / (TIME_NORM)).astype(np.float32)
+
         # Source services
         PV_service  = PV_b.copy()
         LNG_service = LNG_b.copy()
@@ -266,10 +297,22 @@ class TrialEnv(gym.Env):
         ie = industrial_elec_service.astype(float)
         re = residential_elec_service.astype(float)
 
-        gas_loss_samples = (1.0 - ig) * industrial_consumer_gas + (1.0 - rg) * residential_consumer_gas
-        electricity_loss_samples = (1.0 - ie) * industrial_consumer_electricity + (1.0 - re) * residential_consumer_electricity
-        gas_social_samples = (1.0 - rg)
-        electricity_social_samples = (1.0 - re)
+        # === Service-level maximum repair times (if multiple components cause the outage, use the longest repair time) ===
+        # Gas (industrial): LNG + Comp1 + power chain (Sub1/Sub2/Thermal/Comp3)
+        t_max_ig = np.maximum.reduce([t_LNG, t_comp1, t_sub1, t_sub2, t_therm, t_comp3])
+        # Gas (residential): LNG + Comp2 + power chain (Sub1/Sub2/Thermal/Comp3)
+        t_max_rg = np.maximum.reduce([t_LNG, t_comp2, t_sub1, t_sub2, t_therm, t_comp3])
+        # Electricity (industrial): LNG + Comp3 + Thermal + Sub1
+        t_max_ie = np.maximum.reduce([t_LNG, t_comp3, t_therm, t_sub1])
+        # Electricity (residential): PV + Sub2
+        t_max_re = np.maximum.reduce([t_PV, t_sub2])
+
+        # === Time-weighted losses and social impacts ===
+        # Multiply each outage indicator by the corresponding maximum repair time.
+        gas_loss_samples = (1.0 - ig) * industrial_consumer_gas * t_max_ig + (1.0 - rg) * residential_consumer_gas * t_max_rg
+        electricity_loss_samples = (1.0 - ie) * industrial_consumer_electricity * t_max_ie + (1.0 - re) * residential_consumer_electricity * t_max_re
+        gas_social_samples = (1.0 - rg) * t_max_rg
+        electricity_social_samples = (1.0 - re) * t_max_re
 
         w_gas, w_electricity, w_gas_loss, w_gas_social, w_electricity_loss, w_electricity_social = self.weights
 
@@ -302,9 +345,21 @@ class TrialEnv(gym.Env):
         return reward_mean, econ_impact, social_impact
 
     def _obs(self) -> np.ndarray:
-        return np.concatenate(
-            [self.wall_height.astype(np.float32), np.array([self._year, self._econ_impact, self._social_impact], dtype=np.float32)]
-        )
+        if self.normalize_observations:
+            # Normalize wall heights by (h_ref * T), clip to [0,1]
+            denom = (self.h_ref * self.T).astype(np.float32)
+            denom = np.where(denom <= 0.0, 1.0, denom)
+            wh = np.clip(self.wall_height / denom, 0.0, 1.0).astype(np.float32)
+            yr = np.float32(self._year / self.T)
+            econ = np.float32(min(self._econ_impact / 2.0, 1.0))
+            soc = np.float32(min(self._social_impact / 2.0, 1.0))
+            tail = np.array([yr, econ, soc], dtype=np.float32)
+            return np.concatenate([wh, tail])
+        else:
+            return np.concatenate([
+                self.wall_height.astype(np.float32),
+                np.array([self._year, self._econ_impact, self._social_impact], dtype=np.float32),
+            ])
 
     # ------------------------
     # Gym API
@@ -316,6 +371,7 @@ class TrialEnv(gym.Env):
             self.rng = self.np_random
         # Start from new
         self.wall_height = self.initial_wall_height.copy()
+        self.improvement_height = np.zeros(self.N, dtype=np.float32)
         self._year = 0
         _reward0, self._econ_impact, self._social_impact = self._compute_reward()
         # Set previous means to current so first step has zero delta reward
@@ -325,23 +381,37 @@ class TrialEnv(gym.Env):
         self._prev_elec_soc_mean = self.elec_soc_mean
         return self._obs(), {}
 
-    def step(self, action: np.ndarray):
+    def step(self, action):
         # the assumption is that the improvements are always walls. so we estimate the height of the walls based on the investment.
         # the fragility is shifted using the hegith of the wall.
 
-        # Validate and clip to action space
-        action = np.asarray(action, dtype=np.float32).reshape(self.N)
-        action = np.clip(action, self.action_space.low, self.action_space.high)
-        if self.enforce_budget_normalization:
-            s = float(action.sum())
-            if s > 1.0 and s > 0.0:
-                action = action / s
+        # Single-improvement decision: choose exactly one target (or skip)
+        # Preferred input: integer in [0, N] (Discrete action).
+        # Backward-compat: if a vector is passed, treat it as logits/scores and take argmax.
+        choice = None
+        if np.isscalar(action) or (isinstance(action, (np.ndarray, list)) and np.array(action).ndim == 0):
+            choice = int(action)
+        else:
+            scores = np.asarray(action, dtype=np.float32).reshape(-1)
+            if scores.shape[0] == self.N:
+                # assume no-investment score = 0
+                scores = np.concatenate([np.array([0.0], dtype=np.float32), scores], axis=0)
+            assert scores.shape[0] == self.N + 1, f"Expected {self.N+1} scores (including no-investment), got {scores.shape[0]}"
+            choice = int(np.argmax(scores))
 
-        # Improvement 
-        alpha = 4.0    # shape factor (3.5–4.6)
-        u0 = 1800.0    # €/m cost at 1 m wall height
-        beta = 1.2     # cost-height exponent
-        self.improvement_height = self.improvement_height + (self.budget*action/ (alpha * u0 * np.sqrt(self.area))) ** (1 / beta)
+        # Clamp to valid range
+        choice = int(max(0, min(self.N, choice)))
+
+        # Build one-hot allocation over assets (length N); all budget to the chosen asset, or none if choice==0
+        applied_action = np.zeros(self.N, dtype=np.float32)
+        if choice > 0:
+            applied_action[choice - 1] = 1.0
+            unspent_share = 0.0
+        else:
+            unspent_share = 1.0
+
+        # Improvement
+        self.improvement_height = self.improvement_height + (self.budget * applied_action / (self.alpha * self.u0 * np.sqrt(self.area))) ** (1.0 / self.beta)
         self.improvement_height = np.maximum(self.improvement_height, 0.0)
 
         self.wall_height = self.improvement_height + self.initial_wall_height
@@ -357,6 +427,8 @@ class TrialEnv(gym.Env):
         info = {
             "econ_impact": self._econ_impact,
             "social_impact": self._social_impact,
+            "applied_action": applied_action.astype(np.float32),
+            "choice": int(choice),
         }
         return self._obs(), float(reward), terminated, truncated, info
 
