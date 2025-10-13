@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import lognorm
+from fragility_curves import fragility_PV
 
 x = np.linspace(0.001, 10.0, 500)
 
@@ -17,5 +18,10 @@ plt.axvline(np.exp(mu), color='k', linestyle='--', label='Depth = 1')
 plt.xlabel('Depth')
 plt.ylabel('Cumulative probability')
 plt.legend()
+plt.grid(True)
+plt.show()
+
+plt.figure()
+plt.plot(x, fragility_PV(x, 1))
 plt.grid(True)
 plt.show()

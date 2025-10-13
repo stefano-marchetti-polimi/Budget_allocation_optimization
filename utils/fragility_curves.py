@@ -1,3 +1,4 @@
+import imp
 import numpy as np
 from scipy import stats
 
@@ -8,33 +9,33 @@ from scipy import stats
 # the sigmas are based on the complexity and uncertainty of the assset
 
 # lognormal fragility curve for PV systems
-def fragility_PV(depth):
+def fragility_PV(depth, improvement = 0):
     """
     Calculate the probability of failure of a PV system based on the depth of the water.
     """
-    return stats.lognorm.cdf(depth, s=0.05, scale=np.exp(0))
+    return stats.lognorm.cdf(depth, s=0.05, scale=1+improvement)
 
 # dima paper
-def fragility_substation(depth):
+def fragility_substation(depth, improvement = 0):
     """
     Calculate the probability of failure of a substation based on the depth of the water.
     """
-    return stats.lognorm.cdf(depth, s=0.2, scale=np.exp(1.09))
+    return stats.lognorm.cdf(depth, s=0.2, scale=3+improvement)
 
-def fragility_compressor(depth):
+def fragility_compressor(depth, improvement = 0):
     """
     Calculate the probability of failure of a compressor based on the depth of the water.
     """
-    return stats.lognorm.cdf(depth, s=0.2, scale=np.exp(1.09))
+    return stats.lognorm.cdf(depth, s=0.2, scale=3+improvement)
 
-def fragility_thermal_unit(depth):
+def fragility_thermal_unit(depth, improvement = 0):
     """
     Calculate the probability of failure of a thermal unit based on the depth of the water.
     """
-    return stats.lognorm.cdf(depth, s=0.3, scale=np.exp(1.609))
+    return stats.lognorm.cdf(depth, s=0.3, scale=5+improvement)
 
-def fragility_LNG_terminal(depth):
+def fragility_LNG_terminal(depth, improvement = 0):
     """
     Calculate the probability of failure of a thermal unit based on the depth of the water.
     """
-    return stats.lognorm.cdf(depth, s=0.35, scale=np.exp(2.08))
+    return stats.lognorm.cdf(depth, s=0.3, scale=8+improvement)
