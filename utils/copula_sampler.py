@@ -74,25 +74,3 @@ def sample_flood(n, theta, seed=None):
         "height": heights,
         "duration": durations
     })
-
-# Example (5 events)
-print(sample_flood(5, theta, seed=42))
-
-# Scatter plot for 1000 samples
-df_samples = sample_flood(10000, theta, seed=42)
-# Resample heights > 8 until none remain
-while True:
-    mask = df_samples["height"] > 8
-    if not mask.any():
-        break
-    n_resample = mask.sum()
-    df_resample = sample_flood(n_resample, theta, seed=None)
-    df_samples.loc[mask, :] = df_resample.values
-import matplotlib.pyplot as plt
-plt.figure()
-plt.scatter(df_samples["duration"], df_samples["height"], s=10)
-plt.xlabel("Duration (hours)")
-plt.ylabel("Height")
-plt.title("Scatter of 1000 Copula-Based Samples")
-plt.grid(True)
-plt.show()
