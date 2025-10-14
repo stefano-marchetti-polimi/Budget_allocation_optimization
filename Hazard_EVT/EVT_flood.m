@@ -5,7 +5,7 @@ clear all
 load("Data_Moderate.mat")
 
 % Replace with your vectors (same length N)
-H = Data_Moderate(:,1);   % flood HEIGHT exceedances over threshold u_H  (N×1, positive)
+H = Data_Moderate(:,1);   % flood HEIGHT exceedances over threshold u_  (N×1, positive)
 D = Data_Moderate(:,2);   % flood DURATION exceedances over threshold u_D (N×1, positive)
 
 Tr=1.405;   % Treshold for peak over treshold selection

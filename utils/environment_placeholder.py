@@ -2,7 +2,6 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 from typing import Optional
-from scipy.stats import genpareto
 import pandas as pd
 from utils.fragility_curves import (
     fragility_PV,
@@ -12,6 +11,7 @@ from utils.fragility_curves import (
     fragility_LNG_terminal,
 )
 from utils.repair_times import (compressor_repair_time, substation_repair_time, thermal_unit_repair_time, pv_repair_time, LNG_repair_time)
+from utils.copula_sampler import sample_flood
 
 class TrialEnv(gym.Env):
     """
@@ -38,9 +38,10 @@ class TrialEnv(gym.Env):
         csv_path: str = 'outputs/coastal_inundation_samples.csv',
         gpd_k: float = 0.8019,
         gpd_sigma: float = 0.1959,
+        copula_theta: float = 3.816289,
         max_depth: float = 8.0,
         threshold_depth: float = 0.5,
-        rise_rate : float = 0.03,
+        rise_rate : float = 3,
         normalize_observations: bool = True,
     ):
         super().__init__()
@@ -61,6 +62,7 @@ class TrialEnv(gym.Env):
         self.csv_path = csv_path
         self.gpd_k = float(gpd_k)
         self.gpd_sigma = float(gpd_sigma)
+        self.copula_theta = float(copula_theta)
         self.max_depth = float(max_depth)
         self.threshold_depth = float(threshold_depth)
 
@@ -146,8 +148,6 @@ class TrialEnv(gym.Env):
             for name, row in self.ROW_FOR_COMPONENT.items()
         }
 
-        # Pre-build the GPD distribution object
-        self.gpd = genpareto(c=self.gpd_k, scale=self.gpd_sigma, loc=0.0)
 
         self.improvement_height = np.zeros(self.N, dtype=np.float32)
 
@@ -155,14 +155,24 @@ class TrialEnv(gym.Env):
     # Helper computations
     # ------------------------
     def _compute_reward(self) -> tuple[float, float, float]:
-        # Sample flood heights (exceedances + threshold) with an upper cap via resampling
-        samples = self.gpd.rvs(size=self.mc_samples, random_state=self.rng).astype(np.float32)
-        mask = samples > self.max_depth
-        while np.any(mask):
-            samples[mask] = self.gpd.rvs(size=int(np.sum(mask)), random_state=self.rng).astype(np.float32)
+        # Sample joint (height, duration) via copula and enforce max depth by resampling
+        # Use a fresh pseudo-random seed derived from the environment RNG for reproducibility
+        seed_val = int(self.rng.integers(0, 2**31 - 1))
+        df_cop = sample_flood(self.mc_samples, self.copula_theta, seed=seed_val)
+        samples = df_cop["height"].to_numpy(dtype=np.float32)
+        durations = df_cop["duration"].to_numpy(dtype=np.float32)  # currently unused in impacts
+
+        # Resample any heights above max_depth until none remain
+        while True:
             mask = samples > self.max_depth
-        samples += np.float32(self.threshold_depth)
-        samples += self._year*self.rise_rate
+            if not np.any(mask):
+                break
+            n_bad = int(mask.sum())
+            df_res = sample_flood(n_bad, self.copula_theta, seed=None)
+            samples[mask] = df_res["height"].to_numpy(dtype=np.float32)
+
+        # Apply secular rise to sampled depths (do not add threshold again; copula height is assumed absolute)
+        samples = samples + np.float32(self._year * self.rise_rate)
 
         # Nearest-neighbour lookup helper using precomputed arrays
         def nn_lookup(values_array: np.ndarray, query_inputs: np.ndarray) -> np.ndarray:
