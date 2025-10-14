@@ -58,8 +58,6 @@ class TrialEnv(gym.Env):
         # Store configuration
         self.mc_samples = int(mc_samples)
         self.csv_path = csv_path
-        self.gpd_k = float(gpd_k)
-        self.gpd_sigma = float(gpd_sigma)
         self.copula_theta = float(copula_theta)
         self.max_depth = float(max_depth)
         self.threshold_depth = float(threshold_depth)
@@ -245,14 +243,14 @@ class TrialEnv(gym.Env):
         LNG_rt_fn = np.vectorize(lambda d: LNG_repair_time(d, rng=self.rng), otypes=[np.float32])
 
         # Sample per-sample repair times only where the component failed; 0 otherwise
-        t_PV    = np.where(~PV_b,    pv_rt_fn(depth_PV),    0.0).astype(np.float32)
-        t_sub1  = np.where(~sub1_b,  sub_rt_fn(depth_sub1), 0.0).astype(np.float32)
-        t_sub2  = np.where(~sub2_b,  sub_rt_fn(depth_sub2), 0.0).astype(np.float32)
-        t_comp1 = np.where(~comp1_b, comp_rt_fn(depth_comp1), 0.0).astype(np.float32)
-        t_comp2 = np.where(~comp2_b, comp_rt_fn(depth_comp2), 0.0).astype(np.float32)
-        t_comp3 = np.where(~comp3_b, comp_rt_fn(depth_comp3), 0.0).astype(np.float32)
-        t_therm = np.where(~therm_b, therm_rt_fn(depth_therm), 0.0).astype(np.float32)
-        t_LNG   = np.where(~LNG_b,   LNG_rt_fn(depth_LNG),   0.0).astype(np.float32)
+        t_PV    = np.where(~PV_b,    pv_rt_fn(depth_PV)+durations,    0.0).astype(np.float32)
+        t_sub1  = np.where(~sub1_b,  sub_rt_fn(depth_sub1)+durations, 0.0).astype(np.float32)
+        t_sub2  = np.where(~sub2_b,  sub_rt_fn(depth_sub2)+durations, 0.0).astype(np.float32)
+        t_comp1 = np.where(~comp1_b, comp_rt_fn(depth_comp1)+durations, 0.0).astype(np.float32)
+        t_comp2 = np.where(~comp2_b, comp_rt_fn(depth_comp2)+durations, 0.0).astype(np.float32)
+        t_comp3 = np.where(~comp3_b, comp_rt_fn(depth_comp3)+durations, 0.0).astype(np.float32)
+        t_therm = np.where(~therm_b, therm_rt_fn(depth_therm)+durations, 0.0).astype(np.float32)
+        t_LNG   = np.where(~LNG_b,   LNG_rt_fn(depth_LNG)+durations,   0.0).astype(np.float32)
 
         # Normalize all repair times by a fixed maximum (e.g., 1200) so they are in [0,1]
         TIME_NORM = np.float32(1200.0)
