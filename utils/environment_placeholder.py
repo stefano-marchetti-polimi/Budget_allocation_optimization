@@ -38,9 +38,11 @@ class TrialEnv(gym.Env):
         csv_path: str = 'outputs/coastal_inundation_samples.csv',
         copula_theta: float = 3.816289,
         max_depth: float = 8.0,
+        max_duration: float = 100,
         threshold_depth: float = 0.5,
         rise_rate : float = 0.02,
         normalize_observations: bool = True,
+        maximum_repair_time: float = 40.75
     ):
         super().__init__()
         assert num_nodes >= 1, "num_nodes must be >= 1"
@@ -52,6 +54,7 @@ class TrialEnv(gym.Env):
         self.weights = weights
         self.rise_rate = float(rise_rate)
         self.area = area
+        self.maximum_repair_time = float(maximum_repair_time)
         # This environment currently models 8 components explicitly below
         assert num_nodes == 8, "num_nodes must be 8 to match the hardcoded component mapping (PV, 2 substations, 3 compressors, thermal, LNG)."
 
@@ -143,8 +146,6 @@ class TrialEnv(gym.Env):
             name: df.loc[row].reindex(self.input_grid).to_numpy(dtype=np.float32)
             for name, row in self.ROW_FOR_COMPONENT.items()
         }
-
-
         self.improvement_height = np.zeros(self.N, dtype=np.float32)
 
     # ------------------------
@@ -158,10 +159,10 @@ class TrialEnv(gym.Env):
         samples = df_cop["height"].to_numpy(dtype=np.float32)
         durations = df_cop["duration"].to_numpy(dtype=np.float32)  # currently unused in impacts
 
-        # Resample any heights above max_depth until none remain (resample both height and duration together)
+        # Resample any (height > max_depth) OR (duration > max_duration) until none remain
         resample_count = 0
         while True:
-            mask = samples > self.max_depth
+            mask = (samples > self.max_depth) | (durations > self.max_duration)
             if not np.any(mask) or resample_count > 10:
                 break
             n_bad = int(mask.sum())
@@ -171,7 +172,6 @@ class TrialEnv(gym.Env):
             samples[mask] = res_h
             durations[mask] = res_d
             resample_count += 1
-            #print(f"Resampled {n_bad} flood heights above max_depth={self.max_depth:.2f} (total resamples: {resample_count})")
 
         # Apply secular rise to sampled depths (do not add threshold again; copula height is assumed absolute)
         samples = samples + np.float32(self._year * self.rise_rate)

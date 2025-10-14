@@ -25,15 +25,15 @@ from utils.environment_placeholder import TrialEnv  # must be importable at top 
 
 # -------------------- User parameters --------------------
 num_nodes = 8
-years = 50
-year_step = 1
-RL_steps = 4000000
+years = 75 # until 2100
+year_step = 5 # 15 decisions
+RL_steps = 1000000
 
 # Per-asset footprint areas (m^2)
 area = np.array([100, 150, 150, 50, 50, 50, 200, 300], dtype=np.float32)
 
 # Weights: [w_gas, w_electricity, w_gas_loss, w_gas_social, w_electricity_loss, w_electricity_social]
-weights = [0.9, 0.1, 0.9, 0.1, 0.9, 0.1]
+weights = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
 
 env_kwargs = dict(
     num_nodes=num_nodes,
