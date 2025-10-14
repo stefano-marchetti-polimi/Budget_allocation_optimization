@@ -4,10 +4,12 @@
 import os
 import math
 import json
+import csv
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import pandas as pd
+import gymnasium as gym
 
 # ---- Reduce thread thrash across workers ----
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -18,13 +20,14 @@ torch.set_num_threads(1)
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecMonitor
 from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.callbacks import BaseCallback
 from utils.environment_placeholder import TrialEnv  # must be importable at top level
 
 # -------------------- User parameters --------------------
 num_nodes = 8
 years = 50
 year_step = 1
-RL_steps = 500000
+RL_steps = 4000000
 
 # Per-asset footprint areas (m^2)
 area = np.array([100, 150, 150, 50, 50, 50, 200, 300], dtype=np.float32)
@@ -51,6 +54,82 @@ RESULTS_DIR = "results"
 LOG_DIR = "log"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
+
+class ActionDistributionCallback(BaseCallback):
+    """Log discrete action usage per rollout to TensorBoard and CSV."""
+
+    def __init__(self, log_dir: str, log_every: int = 1, verbose: int = 0):
+        super().__init__(verbose)
+        self.log_dir = log_dir
+        self.log_every = max(1, log_every)
+        self._rollouts = 0
+        self._csv_path = os.path.join(log_dir, "train_action_distribution.csv")
+        self._header_written = False
+
+    def _on_training_start(self) -> None:
+        os.makedirs(self.log_dir, exist_ok=True)
+        self._header_written = os.path.exists(self._csv_path)
+
+    def _on_rollout_end(self) -> bool:
+        self._rollouts += 1
+        if self._rollouts % self.log_every != 0:
+            return True
+
+        # Rollout buffer stores latest batch of transitions collected by PPO
+        actions = self.model.rollout_buffer.actions  # type: ignore[attr-defined]
+        if actions is None:
+            return True
+        actions = np.array(actions)
+        if actions.ndim == 3 and actions.shape[-1] == 1:
+            actions = actions.squeeze(-1)
+
+        action_space = self.model.action_space  # type: ignore[attr-defined]
+        if isinstance(action_space, gym.spaces.Discrete):
+            flat_actions = actions.reshape(-1).astype(np.int64)
+            counts = np.bincount(flat_actions, minlength=action_space.n)
+            total = counts.sum()
+            if total == 0:
+                return True
+            freqs = counts / total
+
+            entropy = -(freqs * np.log(freqs + 1e-8)).sum()
+            self.logger.record("train/action_entropy", float(entropy))
+            for idx, freq in enumerate(freqs):
+                self.logger.record(f"train/action_frequency/action_{idx}", float(freq))
+
+            self._write_csv(self.num_timesteps, counts, freqs)
+
+        elif isinstance(action_space, gym.spaces.Box):
+            rollout_actions = actions.reshape(-1, action_space.shape[0])
+            means = rollout_actions.mean(axis=0)
+            stds = rollout_actions.std(axis=0)
+            for idx, (mean, std) in enumerate(zip(means, stds)):
+                self.logger.record(f"train/action_mean/dim_{idx}", float(mean))
+                self.logger.record(f"train/action_std/dim_{idx}", float(std))
+        else:
+            if self.verbose:
+                print(f"[ActionDistributionCallback] Unsupported action space type: {type(action_space)}")
+
+        return True
+
+    def _write_csv(self, timesteps: int, counts: np.ndarray, freqs: np.ndarray) -> None:
+        header = (
+            ["timesteps"]
+            + [f"count_{i}" for i in range(len(counts))]
+            + [f"freq_{i}" for i in range(len(freqs))]
+        )
+        mode = "a"
+        if not self._header_written:
+            mode = "w"
+        with open(self._csv_path, mode, newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            if not self._header_written:
+                writer.writerow(header)
+                self._header_written = True
+            writer.writerow([timesteps] + counts.tolist() + freqs.tolist())
+
+    def _on_step(self) -> bool:
+        return True
 
 def make_env(seed: int, rank: int):
     """Factory for vectorized envs (must be at module top level for pickling)."""
@@ -80,10 +159,10 @@ def main():
 
     # ---------- Vectorization & batching ----------
     cpu_count = os.cpu_count()
-    n_envs = max(4, min(14, cpu_count // 2))  # tune 4–14
+    n_envs = min(max(6, cpu_count - 2), 12) 
 
     # Rollout length per env; total batch = n_envs * n_steps
-    n_steps = 1024
+    n_steps = 2048
     total_batch = n_envs * n_steps
     target_bs = 8192 if 8192 <= total_batch else total_batch
     batch_size = math.gcd(total_batch, target_bs)  # clean divisor
@@ -115,7 +194,9 @@ def main():
         seed=seed,
     )
 
-    model.learn(total_timesteps=RL_steps)
+    action_callback = ActionDistributionCallback(log_dir=LOG_DIR, log_every=1, verbose=0)
+
+    model.learn(total_timesteps=RL_steps, callback=action_callback)
     model.save(os.path.join(RESULTS_DIR, "policy"))
 
     # ---------- Evaluation on a single env ----------
@@ -165,7 +246,7 @@ def main():
     chosen = [int(a) if np.ndim(a) == 0 else int(np.argmax(a)) for a in actions_log]
     plt.plot(years_axis, chosen, linewidth=1.5, marker='o')
     xticks = list(range(num_nodes + 1))
-    labels = ['NoInv'] + [f'Asset_{i+1}' for i in range(num_nodes)]
+    labels = ['No Investment', 'PV', 'Substation1', 'Substation2', 'Compressor1', 'Compressor2', 'Compressor3', 'ThermalUnit', 'LNG']
     plt.yticks(xticks, labels, rotation=0)
     plt.xlabel("Year")
     plt.ylabel("Choice")
