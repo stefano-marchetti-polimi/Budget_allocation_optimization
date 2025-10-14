@@ -44,8 +44,6 @@ env_kwargs = dict(
     area=area,
     mc_samples=10000,
     csv_path='outputs/coastal_inundation_samples.csv',
-    gpd_k=0.8019,
-    gpd_sigma=0.1959,
     max_depth=8.0,
     threshold_depth=0.5,
 )

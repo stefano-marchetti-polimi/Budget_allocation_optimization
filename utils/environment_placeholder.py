@@ -36,12 +36,10 @@ class TrialEnv(gym.Env):
         seed: Optional[int] = None,
         mc_samples: int = 200_000,
         csv_path: str = 'outputs/coastal_inundation_samples.csv',
-        gpd_k: float = 0.8019,
-        gpd_sigma: float = 0.1959,
         copula_theta: float = 3.816289,
         max_depth: float = 8.0,
         threshold_depth: float = 0.5,
-        rise_rate : float = 3,
+        rise_rate : float = 0.02,
         normalize_observations: bool = True,
     ):
         super().__init__()
@@ -162,14 +160,20 @@ class TrialEnv(gym.Env):
         samples = df_cop["height"].to_numpy(dtype=np.float32)
         durations = df_cop["duration"].to_numpy(dtype=np.float32)  # currently unused in impacts
 
-        # Resample any heights above max_depth until none remain
+        # Resample any heights above max_depth until none remain (resample both height and duration together)
+        resample_count = 0
         while True:
             mask = samples > self.max_depth
-            if not np.any(mask):
+            if not np.any(mask) or resample_count > 10:
                 break
             n_bad = int(mask.sum())
             df_res = sample_flood(n_bad, self.copula_theta, seed=None)
-            samples[mask] = df_res["height"].to_numpy(dtype=np.float32)
+            res_h = df_res["height"].to_numpy(dtype=np.float32)
+            res_d = df_res["duration"].to_numpy(dtype=np.float32)
+            samples[mask] = res_h
+            durations[mask] = res_d
+            resample_count += 1
+            #print(f"Resampled {n_bad} flood heights above max_depth={self.max_depth:.2f} (total resamples: {resample_count})")
 
         # Apply secular rise to sampled depths (do not add threshold again; copula height is assumed absolute)
         samples = samples + np.float32(self._year * self.rise_rate)
