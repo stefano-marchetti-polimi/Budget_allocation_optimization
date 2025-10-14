@@ -6,13 +6,13 @@ import numpy as np
 num_nodes = 8
 years = 50
 year_step = 1
-RL_steps = 2000000
+RL_steps = 100000
 
 # Example per-asset footprint areas (m^2); adjust to your assets if needed
 area = np.array([100, 150, 150, 50, 50, 50, 200, 300], dtype=np.float32)
 
 # Optional weights: [w_gas, w_electricity, w_gas_loss, w_gas_social, w_electricity_loss, w_electricity_social]
-weights = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+weights = [0.9, 0.1, 0.9, 0.1, 0.9, 0.1]
 
 # Create environment
 env = TrialEnv(
@@ -22,7 +22,7 @@ env = TrialEnv(
     budget=200000,
     year_step=year_step,
     area=area,
-    mc_samples=10000,           # reduce for speed during training
+    mc_samples=10000,
     csv_path='outputs/coastal_inundation_samples.csv',
     gpd_k=0.8019,
     gpd_sigma=0.1959,
