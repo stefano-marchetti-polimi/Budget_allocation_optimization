@@ -6,7 +6,7 @@ import numpy as np
 num_nodes = 8
 years = 50
 year_step = 1
-RL_steps = 1000000
+RL_steps = 2000000
 
 # Example per-asset footprint areas (m^2); adjust to your assets if needed
 area = np.array([100, 150, 150, 50, 50, 50, 200, 300], dtype=np.float32)
@@ -19,7 +19,7 @@ env = TrialEnv(
     num_nodes=num_nodes,
     years=years,
     weights=weights,
-    budget=100000,
+    budget=200000,
     year_step=year_step,
     area=area,
     mc_samples=10000,           # reduce for speed during training
