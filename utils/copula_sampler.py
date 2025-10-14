@@ -2,7 +2,29 @@
 
 import numpy as np
 import pandas as pd
-from copulas.bivariate import Gumbel
+
+# ---- Direct Gumbel copula sampler (θ ≥ 1) via conditional method ------------
+def _sample_gumbel_uv(n: int, theta: float, rng: np.random.Generator):
+    """Sample (U1, U2) from a Gumbel copula with parameter theta >= 1.
+    Uses the conditional distribution method to avoid numerical root-finding.
+    """
+    theta = float(theta)
+    if theta < 1.0:
+        theta = 1.0  # independence limit
+    eps = 1e-12
+    u1 = rng.uniform(eps, 1.0 - eps, size=n)
+    v = rng.uniform(eps, 1.0 - eps, size=n)
+    # a = (-ln u1)^θ
+    a = (-np.log(u1)) ** theta
+    # target = (-ln(u1*v))^θ - a  ≥ 0
+    target = (-np.log(u1 * v)) ** theta - a
+    target = np.maximum(target, 0.0)
+    b = target ** (1.0 / theta)
+    u2 = np.exp(-b)
+    # Clip away from exact 0/1 for downstream transforms
+    u1 = np.clip(u1, eps, 1.0 - eps)
+    u2 = np.clip(u2, eps, 1.0 - eps)
+    return u1, u2
 
 # ---- Single parameter -------------------------------------------------------
 theta = 3.816289  # Gumbel copula parameter (θ >= 1)
@@ -34,27 +56,10 @@ def gpd_ppf(u, k, sigma):
 # ---- Many draws -------------------------------------------------------------
 def sample_flood(n, theta, seed=None):
     """Sample n events; returns a DataFrame with U1,U2,height,duration."""
-    # Gumbel copula requires theta >= 1.  Treat theta <= 1 as independence (theta=1).
-    cop = Gumbel()
-    theta = float(theta)
-    theta_eff = 1.0 if theta <= 1.0 else theta
-    cop.theta = theta_eff
-    # Ensure Kendall's tau is defined for sampling (the library checks this)
-    cop.tau = 0.0 if theta_eff == 1.0 else 1.0 - 1.0 / theta_eff
-    # Some versions expect stored params / fitted flag
-    try:
-        cop._params = {"theta": theta_eff}
-        cop.is_fitted = True
-    except Exception:
-        pass
-    if seed is not None:
-        try:
-            cop.random_state = np.random.RandomState(seed)
-        except AttributeError:
-            np.random.seed(seed)
-    sample_uv = cop.sample(n)
-    U = sample_uv.to_numpy() if hasattr(sample_uv, "to_numpy") else np.asarray(sample_uv)
-    U1, U2 = U[:, 0], U[:, 1]
+    # RNG
+    rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
+    # Draw from Gumbel copula directly (no root-finding or tau checks)
+    U1, U2 = _sample_gumbel_uv(n, theta, rng)
     k_depth = 0.8019
     k_duration = 0.3929
     sigma_depth = 0.1959
