@@ -19,8 +19,9 @@ points = {
     "P6": (307580.921,	3264174.781),
     "P7": (312418.912,	3251429.175),
     "P8": (265455.097,	3209409.708),
+    "P9": (276712.4,	3242285.64),
 }  # map coords (E, N), same CRS as the raster
-inputs = np.linspace(0, 8, 100)  # meters
+inputs = np.linspace(0, 8, 2)  # meters
 results = {}  # {depth: {point_name: value}}
 Path("outputs").mkdir(parents=True, exist_ok=True)
 
@@ -47,6 +48,6 @@ df = (
     .reindex(index=sorted(points.keys()))
 )
 out_path = Path("outputs/coastal_inundation_samples.csv")
-df.to_csv(out_path, float_format="%.6f")
+#df.to_csv(out_path, float_format="%.6f")
 print("Saved samples to:", out_path)
 print(df)
