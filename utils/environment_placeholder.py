@@ -13,8 +13,6 @@ from utils.fragility_curves import (
 )
 from utils.repair_times import (compressor_repair_time, substation_repair_time, thermal_unit_repair_time, pv_repair_time, LNG_repair_time)
 
-# NEED TO ADD REPAIR TIMES FOR THE IMPACTS!!!!
-
 class TrialEnv(gym.Env):
     """
     Custom environment for sequential (yearly) investment over a network of nodes.
@@ -226,11 +224,11 @@ class TrialEnv(gym.Env):
 
         # === Repair times (hours or days depending on the function) ===
         # Vectorize the repair time functions to accept numpy arrays
-        pv_rt_fn = np.vectorize(pv_repair_time, otypes=[np.float32])
-        sub_rt_fn = np.vectorize(substation_repair_time, otypes=[np.float32])
-        comp_rt_fn = np.vectorize(compressor_repair_time, otypes=[np.float32])
-        therm_rt_fn = np.vectorize(thermal_unit_repair_time, otypes=[np.float32])
-        LNG_rt_fn = np.vectorize(LNG_repair_time, otypes=[np.float32])
+        pv_rt_fn = np.vectorize(lambda d: pv_repair_time(d, rng=self.rng), otypes=[np.float32])
+        sub_rt_fn = np.vectorize(lambda d: substation_repair_time(d, rng=self.rng), otypes=[np.float32])
+        comp_rt_fn = np.vectorize(lambda d: compressor_repair_time(d, rng=self.rng), otypes=[np.float32])
+        therm_rt_fn = np.vectorize(lambda d: thermal_unit_repair_time(d, rng=self.rng), otypes=[np.float32])
+        LNG_rt_fn = np.vectorize(lambda d: LNG_repair_time(d, rng=self.rng), otypes=[np.float32])
 
         # Sample per-sample repair times only where the component failed; 0 otherwise
         t_PV    = np.where(~PV_b,    pv_rt_fn(depth_PV),    0.0).astype(np.float32)
