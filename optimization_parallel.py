@@ -11,7 +11,13 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import gymnasium as gym
 
-#CAN TRY GAE_LAMBDA = 0.9 IF EXPLAINED VARIANCE IS LOW/NEGATIVE
+#CAN TRY GAE_LAMBDA = 0.9 OR LARGER CRITIC NETWORK OR LOWER LEARNING RATE IF EXPLAINED VARIANCE IS LOW/NEGATIVE 
+
+#WHAT IF WE PUT UNCERTAINTY IN THE CLIMATE CHANGE SCENARIO, SO THAT EACH EPISODE IS NOT THE SAME? WITHOUT THAT, EACH EPISODE IS EXACTLY THE SAME FROM THE HAZARD POINT OF VIEW?
+#GAUSSIANA CENTRATA SU MEDIANA CHE A DUE SIGMA HA 5 PERCENTILE E 95 PERCENTILE
+#NEED TO ADD RISE_RATE SAMPLING IN THE RESET
+
+#REWARD NOT DIFFERENCE FROM PREVIOUS TIME STEP?
 
 # ---- Reduce thread thrash across workers ----
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -226,7 +232,7 @@ def main():
     device = "cpu"  # try "mps" and compare wall-clock if your net is large
 
     policy_kwargs = dict(
-    net_arch=dict(pi=[128, 128], vf=[256, 256, 256]),  # bigger critic than actor
+    net_arch=dict(pi=[128, 128], vf=[128,128]),  # vf is critic
     ortho_init=False,
     )
 
@@ -240,7 +246,7 @@ def main():
         n_steps=n_steps,
         batch_size=batch_size,
         n_epochs=n_epochs,
-        learning_rate=2e-4,
+        learning_rate=5e-4,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
