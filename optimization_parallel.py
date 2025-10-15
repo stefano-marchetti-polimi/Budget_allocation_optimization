@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import gymnasium as gym
 
+#CAN TRY GAE_LAMBDA = 0.9 IF EXPLAINED VARIANCE IS LOW/NEGATIVE
+
 # ---- Reduce thread thrash across workers ----
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -20,14 +22,19 @@ torch.set_num_threads(1)
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecMonitor
 from stable_baselines3.common.utils import set_random_seed
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import (
+    BaseCallback,
+    EvalCallback,
+    StopTrainingOnNoModelImprovement,
+    CallbackList,
+)
 from utils.environment_placeholder import TrialEnv  # must be importable at top level
 
 # -------------------- User parameters --------------------
 num_nodes = 8
 years = 75 # until 2100
 year_step = 5 # 15 decisions
-RL_steps = 5000000
+RL_steps = 1000000
 
 # Per-asset footprint areas (m^2)
 area = np.array([100, 150, 150, 50, 50, 50, 200, 300], dtype=np.float32)
@@ -52,6 +59,17 @@ RESULTS_DIR = "results"
 LOG_DIR = "log"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
+
+ASSET_NAMES = [
+    "PV",
+    "Substation1",
+    "Substation2",
+    "Compressor1",
+    "Compressor2",
+    "Compressor3",
+    "ThermalUnit",
+    "LNG",
+]
 
 class ActionDistributionCallback(BaseCallback):
     """Log action usage per rollout to TensorBoard and CSV."""
@@ -92,8 +110,11 @@ class ActionDistributionCallback(BaseCallback):
 
             entropy = -(freqs * np.log(freqs + 1e-8)).sum()
             self.logger.record("train/action_entropy", float(entropy))
-            for idx, freq in enumerate(freqs):
-                self.logger.record(f"train/action_frequency/action_{idx}", float(freq))
+            self.logger.record(
+                "train/action_histogram/discrete",
+                flat_actions,
+                exclude=("stdout", "log", "csv"),
+            )
 
             labels = [f"a{idx}" for idx in range(action_space.n)]
             self._write_csv(self.num_timesteps, counts, freqs, labels)
@@ -104,6 +125,7 @@ class ActionDistributionCallback(BaseCallback):
             all_freqs = []
             labels = []
             for dim, n_choices in enumerate(action_space.nvec):
+                asset_label = ASSET_NAMES[dim] if dim < len(ASSET_NAMES) else f"dim_{dim}"
                 dim_actions = rollout_actions[:, dim].astype(np.int64)
                 dim_counts = np.bincount(dim_actions, minlength=n_choices)
                 total = dim_counts.sum()
@@ -111,11 +133,14 @@ class ActionDistributionCallback(BaseCallback):
                     dim_freqs = np.zeros_like(dim_counts, dtype=np.float64)
                 else:
                     dim_freqs = dim_counts / total
-                for val, freq in enumerate(dim_freqs):
-                    self.logger.record(f"train/action_frequency/dim_{dim}/action_{val}", float(freq))
+                self.logger.record(
+                    f"train/action_histogram/{asset_label}",
+                    dim_actions,
+                    exclude=("stdout", "log", "csv"),
+                )
                 all_counts.append(dim_counts)
                 all_freqs.append(dim_freqs)
-                labels.extend([f"d{dim}_a{val}" for val in range(n_choices)])
+                labels.extend([f"{asset_label}_opt{val}" for val in range(n_choices)])
 
             counts = np.concatenate(all_counts, axis=0)
             freqs = np.concatenate(all_freqs, axis=0)
@@ -176,6 +201,13 @@ def build_vec_env(n_envs: int, seed: int, prefer_subproc: bool = True):
     env = DummyVecEnv(thunks)
     return VecMonitor(env)
 
+def make_eval_env(seed: int):
+    """Single-environment factory for evaluation."""
+    def _factory():
+        env = TrialEnv(**env_kwargs)
+        env.reset(seed=seed)
+        return env
+    return VecMonitor(DummyVecEnv([_factory]))
 def main():
     seed = 42
     set_random_seed(seed)
@@ -193,7 +225,10 @@ def main():
     n_epochs = 5
     device = "cpu"  # try "mps" and compare wall-clock if your net is large
 
-    policy_kwargs = dict(net_arch=[128, 128], ortho_init=False)
+    policy_kwargs = dict(
+    net_arch=dict(pi=[128, 128], vf=[256, 256, 256]),  # bigger critic than actor
+    ortho_init=False,
+    )
 
     # ---------- Build training env ----------
     train_env = build_vec_env(n_envs=n_envs, seed=seed, prefer_subproc=True)
@@ -205,11 +240,13 @@ def main():
         n_steps=n_steps,
         batch_size=batch_size,
         n_epochs=n_epochs,
-        learning_rate=3e-4,
+        learning_rate=2e-4,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
         target_kl=0.02,
+        vf_coef=1.0,                  # upweight critic loss
+        max_grad_norm=0.5,
         policy_kwargs=policy_kwargs,
         verbose=1,
         tensorboard_log="./log",
@@ -219,12 +256,30 @@ def main():
 
     action_callback = ActionDistributionCallback(log_dir=LOG_DIR, log_every=1, verbose=0)
 
-    model.learn(total_timesteps=RL_steps, callback=action_callback)
+    eval_env_vec = make_eval_env(seed + 1000)
+    stop_callback = StopTrainingOnNoModelImprovement(
+        max_no_improvement_evals=5,
+        min_evals=3,
+        verbose=1,
+    )
+    eval_callback = EvalCallback(
+        eval_env_vec,
+        best_model_save_path=RESULTS_DIR,
+        log_path=RESULTS_DIR,
+        eval_freq=10*n_steps,
+        n_eval_episodes=1,
+        deterministic=True,
+        render=False,
+        callback_after_eval=stop_callback,
+    )
+    callback = CallbackList([action_callback, eval_callback])
+
+    model.learn(total_timesteps=RL_steps, callback=callback)
     model.save(os.path.join(RESULTS_DIR, "policy"))
+    eval_env_vec.close()
 
     # ---------- Evaluation on a single env ----------
     eval_env = TrialEnv(**env_kwargs)
-    obs, _ = eval_env.reset(seed=seed + 10)
 
     actions_log = []
     obs_log = []
