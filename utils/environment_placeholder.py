@@ -31,6 +31,7 @@ class TrialEnv(gym.Env):
         num_nodes: int,
         years: int = 50,
         weights: list = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        cost_per_meter: float = 10000.0,
         budget: float = 100000.0,
         year_step: int = 1,
         initial_wall_height = None,
