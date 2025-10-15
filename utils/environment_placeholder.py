@@ -46,9 +46,9 @@ class TrialEnv(gym.Env):
         rise_rate : float = 0.02,
         normalize_observations: bool = True,
         maximum_repair_time: float = 40.75,
-        repeat_asset_penalty: float = -1.0,
-        repeat_noop_penalty: float = -8.0,
-        over_budget_penalty: float = -5.0,
+        repeat_asset_penalty: float = -0.1,
+        repeat_noop_penalty: float = -0.8,
+        over_budget_penalty: float = -0.5,
     ):
         super().__init__()
         assert num_nodes >= 1, "num_nodes must be >= 1"
@@ -88,6 +88,61 @@ class TrialEnv(gym.Env):
             area_array = np.asarray(area, dtype=np.float32)
             assert area_array.shape == (self.N,), "area must have length N"
         self.area = area_array
+
+        # Placeholder supply/people values per compressor and substation (user can adjust later)
+        self.compressor_order = ["Compressor1", "Compressor2", "Compressor3"]
+        compressor_defaults = {
+            "Compressor1": {"gas_supply": 50.0, "people": 0.0},
+            "Compressor2": {"gas_supply": 35.0, "people": 10000.0},
+            "Compressor3": {"gas_supply": 25.0, "people": 0.0},
+        }
+        self.substation_order = ["Substation1", "Substation2"]
+        substation_defaults = {
+            "Substation1": {"power_supply": 70.0, "people": 0.0},
+            "Substation2": {"power_supply": 30.0, "people": 15000.0},
+        }
+
+        self.compressor_gas_supply = np.array(
+            [compressor_defaults[name]["gas_supply"] for name in self.compressor_order],
+            dtype=np.float32,
+        )
+        self.compressor_people = np.array(
+            [compressor_defaults[name]["people"] for name in self.compressor_order],
+            dtype=np.float32,
+        )
+        self.substation_power_supply = np.array(
+            [substation_defaults[name]["power_supply"] for name in self.substation_order],
+            dtype=np.float32,
+        )
+        self.substation_people = np.array(
+            [substation_defaults[name]["people"] for name in self.substation_order],
+            dtype=np.float32,
+        )
+
+        self.total_gas_supply = float(self.compressor_gas_supply.sum())
+        self.total_gas_people = float(self.compressor_people.sum())
+        self.total_power_supply = float(self.substation_power_supply.sum())
+        self.total_power_people = float(self.substation_people.sum())
+
+        if self.total_gas_supply > 0.0:
+            self.compressor_supply_fraction = (self.compressor_gas_supply / self.total_gas_supply).astype(np.float32)
+        else:
+            self.compressor_supply_fraction = np.zeros_like(self.compressor_gas_supply, dtype=np.float32)
+
+        if self.total_gas_people > 0.0:
+            self.compressor_people_fraction = (self.compressor_people / self.total_gas_people).astype(np.float32)
+        else:
+            self.compressor_people_fraction = np.zeros_like(self.compressor_people, dtype=np.float32)
+
+        if self.total_power_supply > 0.0:
+            self.substation_supply_fraction = (self.substation_power_supply / self.total_power_supply).astype(np.float32)
+        else:
+            self.substation_supply_fraction = np.zeros_like(self.substation_power_supply, dtype=np.float32)
+
+        if self.total_power_people > 0.0:
+            self.substation_people_fraction = (self.substation_people / self.total_power_people).astype(np.float32)
+        else:
+            self.substation_people_fraction = np.zeros_like(self.substation_people, dtype=np.float32)
 
         if initial_wall_height is None:
             self.initial_wall_height = np.zeros(self.N, dtype=np.float32)
@@ -240,12 +295,6 @@ class TrialEnv(gym.Env):
         thermal_unit  = (U[6] >= thermal_unit_fragility).astype(np.uint8)
         LNG_terminal_ = (U[7] >= LNG_terminal_fragility).astype(np.uint8)
 
-        # Consumers split
-        industrial_consumer_gas = 0.4
-        industrial_consumer_electricity = 0.7
-        residential_consumer_gas = 0.6
-        residential_consumer_electricity = 0.3
-
         # Booleans for logic operations
         PV_b  = PV_up.astype(bool)
         sub1_b = substation_1.astype(bool)
@@ -264,26 +313,16 @@ class TrialEnv(gym.Env):
         therm_rt_fn = np.vectorize(lambda d: thermal_unit_repair_time(d, rng=self.rng), otypes=[np.float32])
         LNG_rt_fn = np.vectorize(lambda d: LNG_repair_time(d, rng=self.rng), otypes=[np.float32])
 
-        # Sample per-sample repair times only where the component failed; 0 otherwise
-        t_PV    = np.where(~PV_b,    pv_rt_fn(depth_PV)+durations,    0.0).astype(np.float32)
-        t_sub1  = np.where(~sub1_b,  sub_rt_fn(depth_sub1)+durations, 0.0).astype(np.float32)
-        t_sub2  = np.where(~sub2_b,  sub_rt_fn(depth_sub2)+durations, 0.0).astype(np.float32)
-        t_comp1 = np.where(~comp1_b, comp_rt_fn(depth_comp1)+durations, 0.0).astype(np.float32)
-        t_comp2 = np.where(~comp2_b, comp_rt_fn(depth_comp2)+durations, 0.0).astype(np.float32)
-        t_comp3 = np.where(~comp3_b, comp_rt_fn(depth_comp3)+durations, 0.0).astype(np.float32)
-        t_therm = np.where(~therm_b, therm_rt_fn(depth_therm)+durations, 0.0).astype(np.float32)
-        t_LNG   = np.where(~LNG_b,   LNG_rt_fn(depth_LNG)+durations,   0.0).astype(np.float32)
-
-        # Normalize all repair times by a fixed maximum (e.g., 1200) so they are in [0,1]
-        TIME_NORM = np.float32(1200.0)
-        t_PV    = (t_PV    / (TIME_NORM)).astype(np.float32)
-        t_sub1  = (t_sub1  / (TIME_NORM)).astype(np.float32)
-        t_sub2  = (t_sub2  / (TIME_NORM)).astype(np.float32)
-        t_comp1 = (t_comp1 / (TIME_NORM)).astype(np.float32)
-        t_comp2 = (t_comp2 / (TIME_NORM)).astype(np.float32)
-        t_comp3 = (t_comp3 / (TIME_NORM)).astype(np.float32)
-        t_therm = (t_therm / (TIME_NORM)).astype(np.float32)
-        t_LNG   = (t_LNG   / (TIME_NORM)).astype(np.float32)
+        # Sample repair times (exclude flood duration for sequential restoration logic)
+        repair_PV    = np.where(~PV_b,    pv_rt_fn(depth_PV),    0.0).astype(np.float32)
+        repair_sub1  = np.where(~sub1_b,  sub_rt_fn(depth_sub1), 0.0).astype(np.float32)
+        repair_sub2  = np.where(~sub2_b,  sub_rt_fn(depth_sub2), 0.0).astype(np.float32)
+        repair_comp1 = np.where(~comp1_b, comp_rt_fn(depth_comp1), 0.0).astype(np.float32)
+        repair_comp2 = np.where(~comp2_b, comp_rt_fn(depth_comp2), 0.0).astype(np.float32)
+        repair_comp3 = np.where(~comp3_b, comp_rt_fn(depth_comp3), 0.0).astype(np.float32)
+        repair_therm = np.where(~therm_b, therm_rt_fn(depth_therm), 0.0).astype(np.float32)
+        repair_LNG   = np.where(~LNG_b,   LNG_rt_fn(depth_LNG),   0.0).astype(np.float32)
+        flood_duration = durations.astype(np.float32)
 
         # Source services
         PV_service  = PV_b.copy()
@@ -324,27 +363,51 @@ class TrialEnv(gym.Env):
         industrial_elec_service = LNG_service & comp3_service & thermal_unit_service & sub1_service
         residential_elec_service = PV_service & sub2_service
 
-        ig = industrial_gas_service.astype(float)
-        rg = residential_gas_service.astype(float)
-        ie = industrial_elec_service.astype(float)
-        re = residential_elec_service.astype(float)
+        max_event_time = np.float32(self.max_duration + self.maximum_repair_time)
+        max_event_time = np.clip(max_event_time, a_min=np.float32(1e-6), a_max=None)
 
-        # === Service-level maximum repair times (if multiple components cause the outage, use the longest repair time) ===
-        # Gas (industrial): LNG + Comp1 + power chain (Sub1/Sub2/Thermal/Comp3)
-        t_max_ig = np.maximum.reduce([t_LNG, t_comp1, t_sub1, t_sub2, t_therm, t_comp3])
-        # Gas (residential): LNG + Comp2 + power chain (Sub1/Sub2/Thermal/Comp3)
-        t_max_rg = np.maximum.reduce([t_LNG, t_comp2, t_sub1, t_sub2, t_therm, t_comp3])
-        # Electricity (industrial): LNG + Comp3 + Thermal + Sub1
-        t_max_ie = np.maximum.reduce([t_LNG, t_comp3, t_therm, t_sub1])
-        # Electricity (residential): PV + Sub2
-        t_max_re = np.maximum.reduce([t_PV, t_sub2])
+        gas_services = np.stack([comp1_service, comp2_service, comp3_service])
+        gas_service_times = np.stack([
+            np.where(
+                ~industrial_gas_service,
+                flood_duration + repair_LNG + repair_comp1 + repair_sub1 + repair_sub2 + repair_therm + repair_comp3,
+                0.0,
+            ),
+            np.where(
+                ~residential_gas_service,
+                flood_duration + repair_LNG + repair_comp2 + repair_sub1 + repair_sub2 + repair_therm + repair_comp3,
+                0.0,
+            ),
+            np.where(
+                ~comp3_service,
+                flood_duration + repair_LNG + repair_comp3 + repair_sub1 + repair_sub2 + repair_therm,
+                0.0,
+            ),
+        ]).astype(np.float32)
+        gas_time_ratio = np.clip(gas_service_times / max_event_time, a_min=0.0, a_max=1.0)
+        gas_outage_fraction = np.logical_not(gas_services).astype(np.float32) * self.compressor_supply_fraction[:, None]
+        gas_loss_samples = (gas_outage_fraction * gas_time_ratio).sum(axis=0)
+        gas_social_fraction = np.logical_not(gas_services).astype(np.float32) * self.compressor_people_fraction[:, None]
+        gas_social_samples = (gas_social_fraction * gas_time_ratio).sum(axis=0)
 
-        # === Time-weighted losses and social impacts ===
-        # Multiply each outage indicator by the corresponding maximum repair time.
-        gas_loss_samples = (1.0 - ig) * industrial_consumer_gas * t_max_ig + (1.0 - rg) * residential_consumer_gas * t_max_rg
-        electricity_loss_samples = (1.0 - ie) * industrial_consumer_electricity * t_max_ie + (1.0 - re) * residential_consumer_electricity * t_max_re
-        gas_social_samples = (1.0 - rg) * t_max_rg
-        electricity_social_samples = (1.0 - re) * t_max_re
+        power_services = np.stack([industrial_elec_service, residential_elec_service])
+        power_service_times = np.stack([
+            np.where(
+                ~industrial_elec_service,
+                flood_duration + repair_LNG + repair_comp3 + repair_therm + repair_sub1,
+                0.0,
+            ),
+            np.where(
+                ~residential_elec_service,
+                flood_duration + repair_PV + repair_sub2,
+                0.0,
+            ),
+        ]).astype(np.float32)
+        power_time_ratio = np.clip(power_service_times / max_event_time, a_min=0.0, a_max=1.0)
+        power_outage_fraction = np.logical_not(power_services).astype(np.float32) * self.substation_supply_fraction[:, None]
+        electricity_loss_samples = (power_outage_fraction * power_time_ratio).sum(axis=0)
+        power_social_fraction = np.logical_not(power_services).astype(np.float32) * self.substation_people_fraction[:, None]
+        electricity_social_samples = (power_social_fraction * power_time_ratio).sum(axis=0)
 
         w_gas, w_electricity, w_gas_loss, w_gas_social, w_electricity_loss, w_electricity_social = self.weights
 
