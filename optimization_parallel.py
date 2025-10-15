@@ -27,7 +27,7 @@ from utils.environment_placeholder import TrialEnv  # must be importable at top 
 num_nodes = 8
 years = 75 # until 2100
 year_step = 5 # 15 decisions
-RL_steps = 1000000
+RL_steps = 5000000
 
 # Per-asset footprint areas (m^2)
 area = np.array([100, 150, 150, 50, 50, 50, 200, 300], dtype=np.float32)
@@ -54,7 +54,7 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
 class ActionDistributionCallback(BaseCallback):
-    """Log discrete action usage per rollout to TensorBoard and CSV."""
+    """Log action usage per rollout to TensorBoard and CSV."""
 
     def __init__(self, log_dir: str, log_every: int = 1, verbose: int = 0):
         super().__init__(verbose)
@@ -95,7 +95,31 @@ class ActionDistributionCallback(BaseCallback):
             for idx, freq in enumerate(freqs):
                 self.logger.record(f"train/action_frequency/action_{idx}", float(freq))
 
-            self._write_csv(self.num_timesteps, counts, freqs)
+            labels = [f"a{idx}" for idx in range(action_space.n)]
+            self._write_csv(self.num_timesteps, counts, freqs, labels)
+
+        elif isinstance(action_space, gym.spaces.MultiDiscrete):
+            rollout_actions = actions.reshape(-1, len(action_space.nvec))
+            all_counts = []
+            all_freqs = []
+            labels = []
+            for dim, n_choices in enumerate(action_space.nvec):
+                dim_actions = rollout_actions[:, dim].astype(np.int64)
+                dim_counts = np.bincount(dim_actions, minlength=n_choices)
+                total = dim_counts.sum()
+                if total == 0:
+                    dim_freqs = np.zeros_like(dim_counts, dtype=np.float64)
+                else:
+                    dim_freqs = dim_counts / total
+                for val, freq in enumerate(dim_freqs):
+                    self.logger.record(f"train/action_frequency/dim_{dim}/action_{val}", float(freq))
+                all_counts.append(dim_counts)
+                all_freqs.append(dim_freqs)
+                labels.extend([f"d{dim}_a{val}" for val in range(n_choices)])
+
+            counts = np.concatenate(all_counts, axis=0)
+            freqs = np.concatenate(all_freqs, axis=0)
+            self._write_csv(self.num_timesteps, counts, freqs, labels)
 
         elif isinstance(action_space, gym.spaces.Box):
             rollout_actions = actions.reshape(-1, action_space.shape[0])
@@ -110,11 +134,12 @@ class ActionDistributionCallback(BaseCallback):
 
         return True
 
-    def _write_csv(self, timesteps: int, counts: np.ndarray, freqs: np.ndarray) -> None:
+    def _write_csv(self, timesteps: int, counts: np.ndarray, freqs: np.ndarray, labels: list[str]) -> None:
+        assert len(counts) == len(freqs) == len(labels), "Counts, freqs, and labels must align."
         header = (
             ["timesteps"]
-            + [f"count_{i}" for i in range(len(counts))]
-            + [f"freq_{i}" for i in range(len(freqs))]
+            + [f"count_{lbl}" for lbl in labels]
+            + [f"freq_{lbl}" for lbl in labels]
         )
         mode = "a"
         if not self._header_written:

@@ -17,11 +17,13 @@ class TrialEnv(gym.Env):
     """
     Custom environment for sequential (yearly) investment over a network of nodes.
 
-    This variant enforces a **single-improvement** decision at each step: the agent selects exactly one target component (or a no‑investment option), and the **entire yearly budget** is allocated to that target only.
-
-    Action space: `Discrete(N+1)` where 0 = **no investment** (save all budget), and 1..N = invest 100% of the budget in that component.
-
-    Observation normalization (optional): when enabled, the environment returns observations scaled to [0,1].
+    At each decision step the agent chooses wall-height increments for every component from
+    the discrete set {0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0} meters. Positive choices incur
+    component-specific construction costs; if their sum exceeds the yearly budget, the most
+    expensive upgrades are dropped until the action is feasible and a penalty is applied.
+    Reapplying an upgrade to the same component on consecutive steps is cancelled and
+    penalised. Consecutive no-investment decisions are also discouraged with a penalty.
+    Observations can optionally be normalised to lie in [0, 1].
     """
 
     def __init__(
@@ -42,7 +44,10 @@ class TrialEnv(gym.Env):
         threshold_depth: float = 0.5,
         rise_rate : float = 0.02,
         normalize_observations: bool = True,
-        maximum_repair_time: float = 40.75
+        maximum_repair_time: float = 40.75,
+        repeat_asset_penalty: float = -1.0,
+        repeat_noop_penalty: float = -8.0,
+        over_budget_penalty: float = -5.0,
     ):
         super().__init__()
         assert num_nodes >= 1, "num_nodes must be >= 1"
@@ -53,8 +58,11 @@ class TrialEnv(gym.Env):
         self.year_step = int(year_step)
         self.weights = weights
         self.rise_rate = float(rise_rate)
-        self.area = area
         self.maximum_repair_time = float(maximum_repair_time)
+        self.repeat_asset_penalty = float(repeat_asset_penalty)
+        self.repeat_noop_penalty = float(repeat_noop_penalty)
+        self.over_budget_penalty = float(over_budget_penalty)
+        self.max_duration = float(max_duration)
         # This environment currently models 8 components explicitly below
         assert num_nodes == 8, "num_nodes must be 8 to match the hardcoded component mapping (PV, 2 substations, 3 compressors, thermal, LNG)."
 
@@ -73,13 +81,29 @@ class TrialEnv(gym.Env):
         # Normalization toggle
         self.normalize_observations = bool(normalize_observations)
 
-        # Action space: categorical choice of a single target (or no investment)
-        # 0 = no investment; 1..N = invest all budget in that component
-        self.action_space = spaces.Discrete(self.N + 1)
+        if area is None:
+            area_array = np.array([100,150,150,50,50,50,200,300], dtype=np.float32)
+        else:
+            area_array = np.asarray(area, dtype=np.float32)
+            assert area_array.shape == (self.N,), "area must have length N"
+        self.area = area_array
+
+        if initial_wall_height is None:
+            self.initial_wall_height = np.zeros(self.N, dtype=np.float32)
+        else:
+            self.initial_wall_height = np.asarray(initial_wall_height, dtype=np.float32)
+            assert self.initial_wall_height.shape == (self.N,), "initial_wall_height must have length N"
+
+        self.height_levels = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], dtype=np.float32)
+        self.cost_prefactor = (self.alpha * self.u0 * np.sqrt(self.area.astype(np.float32))).astype(np.float32)
+
+        # Multi-discrete action: pick a height increment option for each component
+        action_sizes = np.full(self.N, len(self.height_levels), dtype=np.int64)
+        self.action_space = spaces.MultiDiscrete(action_sizes)
 
         # Observation: [wall_height (N), current_year (1), econ_impact (1), social_impact (1)]
-        # Precompute reference wall-height increment for one full-budget step per asset
-        self.h_ref = (self.budget / (self.alpha * self.u0 * np.sqrt(self.area))) ** (1.0 / self.beta)
+        # Reference scale for normalisation: maximum selectable increment
+        self.h_ref = np.full(self.N, self.height_levels[-1], dtype=np.float32)
         if self.normalize_observations:
             # All features scaled to [0,1]
             low_obs = np.zeros(self.N + 3, dtype=np.float32)
@@ -108,18 +132,8 @@ class TrialEnv(gym.Env):
         self._prev_elec_loss_mean = 0.0
         self._prev_gas_soc_mean = 0.0
         self._prev_elec_soc_mean = 0.0
-
-        if initial_wall_height is None:
-            self.initial_wall_height = np.zeros(self.N, dtype=np.float32)
-        else:
-            self.initial_wall_height = np.asarray(initial_wall_height, dtype=np.float32)
-            assert self.initial_wall_height.shape == (self.N,), "initial_wall_height must have length N"
-
-        if area is None:
-            self.area = np.array([100,150,150,50,50,50,200,300], dtype=np.float32)
-        else:
-            self.area = np.asarray(area, dtype=np.float32)
-            assert self.area.shape == (self.N,), "area must have length N"
+        self._last_positive_mask = np.zeros(self.N, dtype=bool)
+        self._last_was_noop = False
 
         # --- Cache CSV and per-row values for fast nearest-neighbour lookup ---
         df_raw = pd.read_csv(self.csv_path, sep=None, engine='python', header=0, index_col=0)
@@ -151,6 +165,13 @@ class TrialEnv(gym.Env):
     # ------------------------
     # Helper computations
     # ------------------------
+    def _compute_costs(self, height_deltas: np.ndarray) -> np.ndarray:
+        """Return per-component construction costs for the proposed height increments."""
+        deltas = np.asarray(height_deltas, dtype=np.float32)
+        non_negative = np.clip(deltas, a_min=0.0, a_max=None)
+        costs = self.cost_prefactor * np.power(non_negative, self.beta)
+        return costs.astype(np.float32)
+
     def _compute_reward(self) -> tuple[float, float, float]:
         # Sample joint (height, duration) via copula and enforce max depth by resampling
         # Use a fresh pseudo-random seed derived from the environment RNG for reproducibility
@@ -389,42 +410,60 @@ class TrialEnv(gym.Env):
         self._prev_elec_loss_mean = self.elec_loss_mean
         self._prev_gas_soc_mean = self.gas_soc_mean
         self._prev_elec_soc_mean = self.elec_soc_mean
+        self._last_positive_mask = np.zeros(self.N, dtype=bool)
+        self._last_was_noop = False
         return self._obs(), {}
 
     def step(self, action):
-        # the assumption is that the improvements are always walls. so we estimate the height of the walls based on the investment.
-        # the fragility is shifted using the hegith of the wall.
+        # Improvements are wall-height increments chosen from discrete levels per component.
+        action_array = np.asarray(action)
+        if action_array.size != self.N:
+            raise ValueError(f"Expected action with {self.N} entries, received shape {action_array.shape}.")
+        action_array = action_array.astype(np.int64).reshape(self.N)
+        np.clip(action_array, 0, len(self.height_levels) - 1, out=action_array)
 
-        # Single-improvement decision: choose exactly one target (or skip)
-        # Preferred input: integer in [0, N] (Discrete action).
-        # Backward-compat: if a vector is passed, treat it as logits/scores and take argmax.
-        choice = None
-        if np.isscalar(action) or (isinstance(action, (np.ndarray, list)) and np.array(action).ndim == 0):
-            choice = int(action)
-        else:
-            scores = np.asarray(action, dtype=np.float32).reshape(-1)
-            if scores.shape[0] == self.N:
-                # assume no-investment score = 0
-                scores = np.concatenate([np.array([0.0], dtype=np.float32), scores], axis=0)
-            assert scores.shape[0] == self.N + 1, f"Expected {self.N+1} scores (including no-investment), got {scores.shape[0]}"
-            choice = int(np.argmax(scores))
+        intended_heights = self.height_levels[action_array]
+        executed_heights = intended_heights.astype(np.float32).copy()
 
-        # Clamp to valid range
-        choice = int(max(0, min(self.N, choice)))
+        # Penalise repeated upgrades on consecutive steps
+        repeat_mask = self._last_positive_mask & (executed_heights > 0.0)
+        repeat_count = int(repeat_mask.sum())
+        repeat_penalty_total = 0.0
+        if repeat_count:
+            executed_heights[repeat_mask] = 0.0
+            repeat_penalty_total = self.repeat_asset_penalty * repeat_count
 
-        # Build one-hot allocation over assets (length N); all budget to the chosen asset, or none if choice==0
-        applied_action = np.zeros(self.N, dtype=np.float32)
-        if choice > 0:
-            applied_action[choice - 1] = 1.0
-            unspent_share = 0.0
-        else:
-            unspent_share = 1.0
+        costs = self._compute_costs(executed_heights)
+        total_cost = float(costs.sum())
 
-        # Improvement
-        self.improvement_height = self.improvement_height + (self.budget * applied_action / (self.alpha * self.u0 * np.sqrt(self.area))) ** (1.0 / self.beta)
+        trimmed_assets: list[int] = []
+        over_budget_penalty_total = 0.0
+        if total_cost > self.budget:
+            # Drop the most expensive upgrades until affordable
+            order = np.argsort(costs)[::-1]
+            for idx in order:
+                if executed_heights[idx] <= 0.0:
+                    continue
+                trimmed_assets.append(int(idx))
+                total_cost -= float(costs[idx])
+                executed_heights[idx] = 0.0
+                if total_cost <= self.budget:
+                    break
+            if trimmed_assets:
+                costs = self._compute_costs(executed_heights)
+                total_cost = float(costs.sum())
+                over_budget_penalty_total = self.over_budget_penalty * len(trimmed_assets)
+
+        # Apply realised improvements
+        self.improvement_height = (self.improvement_height + executed_heights).astype(np.float32)
         self.improvement_height = np.maximum(self.improvement_height, 0.0)
-
         self.wall_height = self.improvement_height + self.initial_wall_height
+        self._last_positive_mask = executed_heights > 0.0
+        noop_penalty = 0.0
+        is_noop = bool(np.all(executed_heights <= 0.0))
+        if is_noop and self._last_was_noop:
+            noop_penalty = self.repeat_noop_penalty
+        self._last_was_noop = is_noop
 
         # Advance time
         self._year += self.year_step
@@ -432,15 +471,30 @@ class TrialEnv(gym.Env):
         # Recompute impacts for current state
         reward, self._econ_impact, self._social_impact = self._compute_reward()
 
+        total_penalty = repeat_penalty_total + over_budget_penalty_total + noop_penalty
+        reward = float(reward + total_penalty)
+
         terminated = bool(self._year >= self.T)
         truncated = False
         info = {
             "econ_impact": self._econ_impact,
             "social_impact": self._social_impact,
-            "applied_action": applied_action.astype(np.float32),
-            "choice": int(choice),
+            "intended_heights": intended_heights.astype(np.float32),
+            "executed_heights": executed_heights.astype(np.float32),
+            "costs": costs.astype(np.float32),
+            "total_cost": float(total_cost),
+            "unused_budget": float(max(self.budget - total_cost, 0.0)),
         }
-        return self._obs(), float(reward), terminated, truncated, info
+        if repeat_count:
+            info["repeat_penalty"] = float(repeat_penalty_total)
+            info["repeat_penalty_assets"] = [int(i) for i in np.nonzero(repeat_mask)[0]]
+        if trimmed_assets:
+            info["trimmed_assets"] = trimmed_assets
+        if over_budget_penalty_total != 0.0:
+            info["over_budget_penalty"] = float(over_budget_penalty_total)
+        if noop_penalty != 0.0:
+            info["repeat_noop_penalty"] = float(noop_penalty)
+        return self._obs(), reward, terminated, truncated, info
 
     def render(self):
         print(
