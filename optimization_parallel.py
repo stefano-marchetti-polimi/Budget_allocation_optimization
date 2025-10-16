@@ -12,13 +12,13 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import gymnasium as gym
 
+SCENARIO_NAME = "neutral"  # decision-maker preferences
+
 #CAN TRY GAE_LAMBDA = 0.9 OR LARGER CRITIC NETWORK OR DIFFERENT LEARNING RATE IF EXPLAINED VARIANCE IS STILL LOW/NEGATIVE 
 
 #WHAT IF WE PUT UNCERTAINTY IN THE CLIMATE CHANGE SCENARIO, SO THAT EACH EPISODE IS NOT THE SAME? WITHOUT THAT, EACH EPISODE IS EXACTLY THE SAME FROM THE HAZARD POINT OF VIEW?
 #GAUSSIANA CENTRATA SU MEDIANA CHE A DUE SIGMA HA 5 PERCENTILE E 95 PERCENTILE
 #NEED TO ADD RISE_RATE SAMPLING IN THE RESET
-
-#REWARD NOT DIFFERENCE FROM PREVIOUS TIME STEP?
 
 # ---- Reduce thread thrash across workers ----
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -37,6 +37,66 @@ from stable_baselines3.common.callbacks import (
 )
 from utils.environment_placeholder import TrialEnv  # must be importable at top level
 
+WEIGHT_VECTOR_KEYS = ("W_g", "W_e", "W_ge", "W_gs", "W_ee", "W_es")
+
+
+def load_dm_weight_schedule(csv_path: str, scenario: str, years: int, year_step: int) -> tuple[np.ndarray, list[int]]:
+    """Load time-dependent weights for the requested scenario."""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Scenario file not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    df.columns = [col.strip() for col in df.columns]
+
+    if "scenario" not in df.columns or "weight" not in df.columns:
+        raise ValueError("Scenario CSV must include 'scenario' and 'weight' columns.")
+
+    df["scenario"] = df["scenario"].astype(str).str.strip()
+    df["weight"] = df["weight"].astype(str).str.strip()
+
+    scenario_df = df[df["scenario"] == scenario].copy()
+    if scenario_df.empty:
+        available = sorted(df["scenario"].astype(str).str.strip().unique())
+        raise ValueError(f"Scenario '{scenario}' not found. Available scenarios: {available}")
+
+    duplicate_weights = scenario_df["weight"][scenario_df["weight"].duplicated()].unique()
+    if len(duplicate_weights):
+        raise ValueError(f"Duplicate weight rows for {duplicate_weights.tolist()} in scenario '{scenario}'.")
+
+    scenario_df = scenario_df.set_index("weight")
+    scenario_df = scenario_df.drop(columns=["scenario", "commodity"], errors="ignore")
+
+    missing_keys = [key for key in WEIGHT_VECTOR_KEYS if key not in scenario_df.index]
+    if missing_keys:
+        raise ValueError(f"Scenario '{scenario}' missing entries for {missing_keys}.")
+
+    value_cols = [col for col in scenario_df.columns if col.strip()]
+    if not value_cols:
+        raise ValueError(f"No time-step columns found for scenario '{scenario}'.")
+
+    try:
+        sorted_cols = sorted(value_cols, key=lambda c: int(float(c)))
+    except ValueError as exc:
+        raise ValueError("Time-step columns must be numeric (years).") from exc
+
+    required_points = math.ceil(years / year_step) + 1
+    if len(sorted_cols) < required_points:
+        raise ValueError(
+            f"Scenario '{scenario}' provides {len(sorted_cols)} time points; "
+            f"{required_points} required for {years} years with step {year_step}."
+        )
+
+    selected_cols = sorted_cols[:required_points]
+    weights_df = scenario_df.reindex(WEIGHT_VECTOR_KEYS)[selected_cols].apply(pd.to_numeric, errors="coerce")
+
+    if weights_df.isnull().any().any():
+        missing_cols = weights_df.columns[weights_df.isnull().any()].tolist()
+        raise ValueError(f"Scenario '{scenario}' contains NaNs for years {missing_cols}.")
+
+    schedule = weights_df.to_numpy(dtype=np.float32).T
+    decision_years = [int(float(col)) for col in selected_cols]
+    return schedule, decision_years
+
 # -------------------- User parameters --------------------
 num_nodes = 8
 years = 75 # until 2100
@@ -46,13 +106,18 @@ RL_steps = 5000000
 # Per-asset footprint areas (m^2)
 area = np.array([100, 150, 150, 50, 50, 50, 200, 300], dtype=np.float32)
 
-# Weights: [w_gas, w_electricity, w_gas_loss, w_gas_social, w_electricity_loss, w_electricity_social]
-weights = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+DM_SCENARIOS_PATH = os.path.join("Decision Makers Preferences", "DM_Scenarios.csv")
+weights_schedule, weight_years = load_dm_weight_schedule(
+    DM_SCENARIOS_PATH,
+    SCENARIO_NAME,
+    years,
+    year_step,
+)
 
 env_kwargs = dict(
     num_nodes=num_nodes,
     years=years,
-    weights=weights,
+    weights=weights_schedule,
     budget=200000,
     year_step=year_step,
     area=area,
@@ -60,6 +125,7 @@ env_kwargs = dict(
     csv_path='outputs/coastal_inundation_samples.csv',
     max_depth=8.0,
     threshold_depth=0.5,
+    weight_years=weight_years,
 )
 
 RESULTS_DIR = "results"

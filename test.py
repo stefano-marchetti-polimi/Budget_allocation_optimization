@@ -23,6 +23,7 @@ from optimization_parallel import (
     ASSET_NAMES,
     RESULTS_DIR,
     CHECKPOINT_DIR,
+    WEIGHT_VECTOR_KEYS,
     TrialEnv,
     env_kwargs,
     year_step,
@@ -108,6 +109,8 @@ def rollout_episode(
         actions_log.append(action_array)
         obs_log.append(np.asarray(obs))
         obs, reward, terminated, truncated, info = env.step(action)
+        current_weights = np.asarray(env.weights, dtype=np.float32).copy()
+        info["weights"] = current_weights
         infos_log.append(info)
         rewards_log.append(float(reward))
 
@@ -153,6 +156,8 @@ def rollout_episode(
         print(f"Step {step_idx:02d} | Year {current_year}")
         print(f"  Actions: {', '.join(action_pairs)}")
         print(f"  Reward: {reward:.3f}")
+        weight_pairs = [f"{key}={float(current_weights[idx]):.3f}" for idx, key in enumerate(WEIGHT_VECTOR_KEYS)]
+        print(f"  Weights: {', '.join(weight_pairs)}")
         if budget_parts:
             print(f"  Budget: {', '.join(budget_parts)}")
         if penalty_msgs:
@@ -194,6 +199,11 @@ def save_logs(
         intended_cols[f"intended_height_{asset_label}"] = intended_stack[:, idx]
         executed_cols[f"executed_height_{asset_label}"] = executed_stack[:, idx]
 
+    weights_stack = np.vstack([info["weights"] for info in infos_log])
+    weight_cols = {
+        f"weight_{key}": weights_stack[:, idx] for idx, key in enumerate(WEIGHT_VECTOR_KEYS)
+    }
+
     penalty_cols = {
         "repeat_penalty": [info.get("repeat_penalty", 0.0) for info in infos_log],
         "cost_penalty": [info.get("cost_penalty", 0.0) for info in infos_log],
@@ -213,6 +223,7 @@ def save_logs(
             **action_cols,
             **intended_cols,
             **executed_cols,
+            **weight_cols,
             **penalty_cols,
             "reward": rewards_log,
             "obs_json": obs_str,
@@ -243,6 +254,18 @@ def save_logs(
     fig.subplots_adjust(top=0.95)
     fig.savefig(os.path.join(RESULTS_DIR, "action_over_time.png"))
     plt.close(fig)
+
+    plt.figure(figsize=(10, 4))
+    for idx, key in enumerate(WEIGHT_VECTOR_KEYS):
+        plt.plot(years_axis, weights_stack[:, idx], marker="o", linewidth=1.5, label=key)
+    plt.xlabel("Year")
+    plt.ylabel("Weight value")
+    plt.title("Decision-Maker Weights Over Time")
+    plt.legend(loc="best")
+    plt.grid(True, axis="both", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "weights_over_time.png"))
+    plt.close()
 
     n_assets = actions_arr.shape[1]
     ncols = min(3, n_assets)
