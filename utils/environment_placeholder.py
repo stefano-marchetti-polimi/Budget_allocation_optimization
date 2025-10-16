@@ -245,17 +245,20 @@ class TrialEnv(gym.Env):
         action_sizes = np.full(self.N, len(self.height_levels), dtype=np.int64)
         self.action_space = spaces.MultiDiscrete(action_sizes)
 
-        # Observation: [wall_height (N), current_year (1), econ_impact (1), social_impact (1)]
+        # Observation: [wall_height (N), current_year (1), sea_level_offset (1), econ_impact (1), social_impact (1)]
         # Reference scale for normalisation: maximum selectable increment
         self.h_ref = np.full(self.N, self.height_levels[-1], dtype=np.float32)
         if self.normalize_observations:
             # All features scaled to [0,1]
-            low_obs = np.zeros(self.N + 3, dtype=np.float32)
-            high_obs = np.ones(self.N + 3, dtype=np.float32)
+            low_obs = np.zeros(self.N + 4, dtype=np.float32)
+            high_obs = np.ones(self.N + 4, dtype=np.float32)
         else:
             # Raw ranges (year in [0, T]; impacts nonnegative; wall heights unbounded above)
-            high_obs = np.array([1] * self.N + [float(self.T)] + [np.finfo(np.float32).max] * 2, dtype=np.float32)
-            low_obs = np.zeros(self.N + 3, dtype=np.float32)
+            high_obs = np.array(
+                [1] * self.N + [float(self.T)] + [np.finfo(np.float32).max] * 3,
+                dtype=np.float32,
+            )
+            low_obs = np.zeros(self.N + 4, dtype=np.float32)
         self.observation_space = spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
 
         # RNG seed / state
@@ -622,20 +625,25 @@ class TrialEnv(gym.Env):
         )
 
     def _obs(self) -> np.ndarray:
+        sea_level_offset = float(self._sea_level_offset_for_year(self._year))
         if self.normalize_observations:
             # Normalize wall heights by (h_ref * T), clip to [0,1]
             denom = (self.h_ref * self.T).astype(np.float32)
             denom = np.where(denom <= 0.0, 1.0, denom)
             wh = np.clip(self.wall_height / denom, 0.0, 1.0).astype(np.float32)
             yr = np.float32(self._year / self.T)
+            if self.max_depth > 0.0:
+                sea = np.float32(np.clip(sea_level_offset / self.max_depth, 0.0, 1.0))
+            else:
+                sea = np.float32(0.0)
             econ = np.float32(min(self._econ_impact / 2.0, 1.0))
             soc = np.float32(min(self._social_impact / 2.0, 1.0))
-            tail = np.array([yr, econ, soc], dtype=np.float32)
+            tail = np.array([yr, sea, econ, soc], dtype=np.float32)
             return np.concatenate([wh, tail])
         else:
             return np.concatenate([
                 self.wall_height.astype(np.float32),
-                np.array([self._year, self._econ_impact, self._social_impact], dtype=np.float32),
+                np.array([self._year, sea_level_offset, self._econ_impact, self._social_impact], dtype=np.float32),
             ])
 
     # ------------------------

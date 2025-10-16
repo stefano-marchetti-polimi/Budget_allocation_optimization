@@ -12,8 +12,20 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import gymnasium as gym
 
+# -------------------- User parameters --------------------
 SCENARIO_NAME = "neutral"  # decision-maker preferences
 CLIMATE_SCENARIO = "SSP1-1.9" # sea level rise projections
+BUDGET = 500000
+MC_SAMPLES = 50000
+
+num_nodes = 8
+years = 75 # until 2100
+year_step = 5 # 15 decisions
+RL_steps = 5000000
+
+# Per-asset footprint areas (m^2)
+area = np.array([100, 150, 150, 50, 50, 50, 200, 300], dtype=np.float32)
+
 
 #CAN TRY GAE_LAMBDA = 0.9 OR LARGER CRITIC NETWORK OR DIFFERENT LEARNING RATE IF EXPLAINED VARIANCE IS STILL LOW/NEGATIVE 
 
@@ -194,16 +206,6 @@ def load_sea_level_scenarios(
 
     return scenario_params, decision_years
 
-
-# -------------------- User parameters --------------------
-num_nodes = 8
-years = 75 # until 2100
-year_step = 5 # 15 decisions
-RL_steps = 5000000
-
-# Per-asset footprint areas (m^2)
-area = np.array([100, 150, 150, 50, 50, 50, 200, 300], dtype=np.float32)
-
 DM_SCENARIOS_PATH = os.path.join("Decision Makers Preferences", "DM_Scenarios.csv")
 weights_schedule, weight_years = load_dm_weight_schedule(
     DM_SCENARIOS_PATH,
@@ -223,10 +225,10 @@ env_kwargs = dict(
     num_nodes=num_nodes,
     years=years,
     weights=weights_schedule,
-    budget=200000,
+    budget=BUDGET,
     year_step=year_step,
     area=area,
-    mc_samples=1000,
+    mc_samples=MC_SAMPLES,
     csv_path='outputs/coastal_inundation_samples.csv',
     max_depth=8.0,
     threshold_depth=0.5,
