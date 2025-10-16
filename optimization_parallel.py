@@ -5,13 +5,20 @@ import os
 import math
 import json
 import csv
+import shutil
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import pandas as pd
 import gymnasium as gym
 
-#CAN TRY GAE_LAMBDA = 0.9 IF EXPLAINED VARIANCE IS LOW/NEGATIVE
+#CAN TRY GAE_LAMBDA = 0.9 OR LARGER CRITIC NETWORK OR DIFFERENT LEARNING RATE IF EXPLAINED VARIANCE IS STILL LOW/NEGATIVE 
+
+#WHAT IF WE PUT UNCERTAINTY IN THE CLIMATE CHANGE SCENARIO, SO THAT EACH EPISODE IS NOT THE SAME? WITHOUT THAT, EACH EPISODE IS EXACTLY THE SAME FROM THE HAZARD POINT OF VIEW?
+#GAUSSIANA CENTRATA SU MEDIANA CHE A DUE SIGMA HA 5 PERCENTILE E 95 PERCENTILE
+#NEED TO ADD RISE_RATE SAMPLING IN THE RESET
+
+#REWARD NOT DIFFERENCE FROM PREVIOUS TIME STEP?
 
 # ---- Reduce thread thrash across workers ----
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -25,8 +32,8 @@ from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.callbacks import (
     BaseCallback,
     EvalCallback,
-    StopTrainingOnNoModelImprovement,
     CallbackList,
+    CheckpointCallback,
 )
 from utils.environment_placeholder import TrialEnv  # must be importable at top level
 
@@ -34,7 +41,7 @@ from utils.environment_placeholder import TrialEnv  # must be importable at top 
 num_nodes = 8
 years = 75 # until 2100
 year_step = 5 # 15 decisions
-RL_steps = 1000000
+RL_steps = 5000000
 
 # Per-asset footprint areas (m^2)
 area = np.array([100, 150, 150, 50, 50, 50, 200, 300], dtype=np.float32)
@@ -49,7 +56,7 @@ env_kwargs = dict(
     budget=200000,
     year_step=year_step,
     area=area,
-    mc_samples=10000,
+    mc_samples=1000,
     csv_path='outputs/coastal_inundation_samples.csv',
     max_depth=8.0,
     threshold_depth=0.5,
@@ -59,6 +66,10 @@ RESULTS_DIR = "results"
 LOG_DIR = "log"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
+BEST_MODEL_DIR = os.path.join(RESULTS_DIR, "best_models")
+CHECKPOINT_DIR = os.path.join(RESULTS_DIR, "checkpoints")
+os.makedirs(BEST_MODEL_DIR, exist_ok=True)
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
 ASSET_NAMES = [
     "PV",
@@ -70,6 +81,18 @@ ASSET_NAMES = [
     "ThermalUnit",
     "LNG",
 ]
+
+
+def linear_schedule(start: float, end: float):
+    """Create a linear schedule function compatible with SB3 progress callback."""
+    start = float(start)
+    end = float(end)
+
+    def schedule(progress_remaining: float) -> float:
+        # progress_remaining ∈ [0,1], where 1 is beginning of training
+        return end + (start - end) * float(progress_remaining)
+
+    return schedule
 
 class ActionDistributionCallback(BaseCallback):
     """Log action usage per rollout to TensorBoard and CSV."""
@@ -179,6 +202,30 @@ class ActionDistributionCallback(BaseCallback):
     def _on_step(self) -> bool:
         return True
 
+
+class EntropyScheduleCallback(BaseCallback):
+    """Update PPO entropy coefficient following a schedule driven by training progress."""
+
+    def __init__(self, schedule_fn, verbose: int = 0):
+        super().__init__(verbose)
+        self.schedule_fn = schedule_fn
+
+    def _apply_schedule(self) -> None:
+        # `_current_progress_remaining` is managed by SB3 (1.0 -> 0.0)
+        progress = getattr(self.model, "_current_progress_remaining", None)
+        if progress is None:
+            total = getattr(self.model, "_total_timesteps", None) or 1.0
+            progress = 1.0 - (self.model.num_timesteps / float(total))
+        new_coef = float(self.schedule_fn(progress))
+        self.model.ent_coef = new_coef
+
+    def _on_training_start(self) -> None:
+        self._apply_schedule()
+
+    def _on_step(self) -> bool:
+        self._apply_schedule()
+        return True
+
 def make_env(seed: int, rank: int):
     """Factory for vectorized envs (must be at module top level for pickling)."""
     def _thunk():
@@ -208,9 +255,17 @@ def make_eval_env(seed: int):
         env.reset(seed=seed)
         return env
     return VecMonitor(DummyVecEnv([_factory]))
+
+def reset_output_dirs() -> None:
+    """Remove checkpoint/best model directories so each run starts clean."""
+    for path in (BEST_MODEL_DIR, CHECKPOINT_DIR):
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        os.makedirs(path, exist_ok=True)
 def main():
     seed = 42
     set_random_seed(seed)
+    reset_output_dirs()
 
     # ---------- Vectorization & batching ----------
     cpu_count = os.cpu_count()
@@ -226,14 +281,29 @@ def main():
     device = "cpu"  # try "mps" and compare wall-clock if your net is large
 
     policy_kwargs = dict(
-    net_arch=dict(pi=[128, 128], vf=[256, 256, 256]),  # bigger critic than actor
+    net_arch=dict(pi=[128, 128], vf=[128,128]),  # vf is critic
     ortho_init=False,
     )
 
     # ---------- Build training env ----------
     train_env = build_vec_env(n_envs=n_envs, seed=seed, prefer_subproc=True)
+    vec_envs = train_env.num_envs
+    rollout_timesteps = vec_envs * n_steps  # actual environment transitions gathered per PPO update
+    eval_every_rollouts = 10
+
+    # SB3 callbacks count environment steps (i.e. calls to env.step), not aggregated timesteps.
+    # Convert desired frequencies (expressed in actual timesteps) into callback steps so saves fire as expected.
+    steps_per_callback_call = max(1, vec_envs)
+    checkpoint_save_freq = max(1, math.ceil(rollout_timesteps / steps_per_callback_call))*5
+    eval_callback_freq = max(1, math.ceil((eval_every_rollouts * rollout_timesteps) / steps_per_callback_call))
+    print(
+        f"[train] vector envs={vec_envs} | checkpoint every {checkpoint_save_freq * vec_envs} timesteps "
+        f"| eval every {eval_callback_freq * vec_envs} timesteps"
+    )
 
     # ---------- PPO ----------
+    ent_schedule = linear_schedule(start=0.03, end=0.0)
+
     model = PPO(
         "MlpPolicy",
         train_env,
@@ -244,7 +314,7 @@ def main():
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        target_kl=0.02,
+        ent_coef=float(ent_schedule(1.0)),
         vf_coef=1.0,                  # upweight critic loss
         max_grad_norm=0.5,
         policy_kwargs=policy_kwargs,
@@ -255,114 +325,32 @@ def main():
     )
 
     action_callback = ActionDistributionCallback(log_dir=LOG_DIR, log_every=1, verbose=0)
+    entropy_callback = EntropyScheduleCallback(schedule_fn=ent_schedule, verbose=0)
 
     eval_env_vec = make_eval_env(seed + 1000)
-    stop_callback = StopTrainingOnNoModelImprovement(
-        max_no_improvement_evals=5,
-        min_evals=3,
-        verbose=1,
-    )
     eval_callback = EvalCallback(
         eval_env_vec,
-        best_model_save_path=RESULTS_DIR,
+        best_model_save_path=BEST_MODEL_DIR,
         log_path=RESULTS_DIR,
-        eval_freq=10*n_steps,
+        eval_freq=eval_callback_freq,
         n_eval_episodes=1,
         deterministic=True,
         render=False,
-        callback_after_eval=stop_callback,
     )
-    callback = CallbackList([action_callback, eval_callback])
+    # Checkpoint every full rollout (n_steps * num_envs actual timesteps)
+    checkpoint_callback = CheckpointCallback(
+        save_freq=checkpoint_save_freq,
+        save_path=CHECKPOINT_DIR,
+        name_prefix="policy_checkpoint",
+        save_replay_buffer=False,
+        save_vecnormalize=False,
+        verbose=0,
+    )
+    callback = CallbackList([entropy_callback, action_callback, eval_callback, checkpoint_callback])
 
     model.learn(total_timesteps=RL_steps, callback=callback)
     model.save(os.path.join(RESULTS_DIR, "policy"))
     eval_env_vec.close()
-
-    # ---------- Evaluation on a single env ----------
-    eval_env = TrialEnv(**env_kwargs)
-
-    actions_log = []
-    obs_log = []
-    rewards_log = []
-
-    terminated = False
-    truncated = False
-
-    while not (terminated or truncated):
-        action, _ = model.predict(obs, deterministic=True)
-        actions_log.append(np.asarray(action, dtype=np.float32))  # shape (num_nodes,) for Box OR scalar for Discrete
-        obs_log.append(np.asarray(obs))
-        obs, reward, terminated, truncated, info = eval_env.step(action)
-        rewards_log.append(float(reward))
-
-    # ---------- Save logs ----------
-    # If actions are scalar (Discrete), convert to one-hot columns for consistency
-    if np.ndim(actions_log[0]) == 0:
-        # Discrete: map to one-hot of length (num_nodes+1) with index 0 = no-invest
-        one_hots = []
-        for a in actions_log:
-            oh = np.zeros(num_nodes + 1, dtype=np.float32)
-            oh[int(a)] = 1.0
-            one_hots.append(oh)
-        actions_arr = np.vstack(one_hots)
-        action_cols = {f"action_onehot_{i}": actions_arr[:, i] for i in range(num_nodes + 1)}
-    else:
-        actions_arr = np.vstack(actions_log)
-        action_cols = {f"action_{i}": actions_arr[:, i] for i in range(actions_arr.shape[1])}
-
-    obs_str = [json.dumps(np.asarray(o).tolist()) for o in obs_log]
-
-    df = pd.DataFrame({**action_cols, "reward": rewards_log, "obs_json": obs_str})
-    df.to_csv(os.path.join(RESULTS_DIR, "evaluation_logs.csv"), index=False)
-
-    # ---------- Plots ----------
-    # For Discrete actions, plot the chosen index over time and a histogram of choices
-    years_axis = [i * year_step for i in range(len(actions_log))]
-
-    plt.figure(figsize=(10, 4))
-    # Convert possibly array actions to ints
-    chosen = [int(a) if np.ndim(a) == 0 else int(np.argmax(a)) for a in actions_log]
-    plt.plot(years_axis, chosen, linewidth=1.5, marker='o')
-    xticks = list(range(num_nodes + 1))
-    labels = ['No Investment', 'PV', 'Substation1', 'Substation2', 'Compressor1', 'Compressor2', 'Compressor3', 'ThermalUnit', 'LNG']
-    plt.yticks(xticks, labels, rotation=0)
-    plt.xlabel("Year")
-    plt.ylabel("Choice")
-    plt.title("Chosen Action Over Time")
-    plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "action_over_time.png"))
-    plt.close()
-
-    plt.figure(figsize=(8, 4))
-    plt.hist(chosen, bins=np.arange(num_nodes + 2) - 0.5, rwidth=0.9)
-    plt.xticks(xticks, labels, rotation=45)
-    plt.xlabel("Chosen Action")
-    plt.ylabel("Frequency")
-    plt.title("Action Choice Distribution")
-    plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "action_histogram.png"))
-    plt.close()
-
-    # Reward over time
-    plt.figure(figsize=(10, 4))
-    plt.plot(years_axis, rewards_log, linewidth=1.5)
-    plt.xlabel("Year")
-    plt.ylabel("Reward")
-    plt.title("Reward Over Time")
-    plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "reward_over_time.png"))
-    plt.close()
-
-    # ---------- Cleanup ----------
-    eval_env.close()
-    train_env.close()
-
-    print(
-        f"Done.\n"
-        f"Train envs: {n_envs}, n_steps: {n_steps}, total_batch: {n_envs * n_steps}, "
-        f"batch_size: {batch_size}, n_epochs: {n_epochs}, device: {device}\n"
-        f"Saved: {RESULTS_DIR}/policy, evaluation_logs.csv, and plots."
-    )
 
 if __name__ == "__main__":
     # Important for macOS / spawn start method
