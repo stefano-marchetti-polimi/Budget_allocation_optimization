@@ -432,7 +432,25 @@ class TrialEnv(gym.Env):
         self._base_heights = heights
         self._base_durations = durations
 
-    def _compute_metrics(self, improvement_height: np.ndarray, year: float) -> tuple[float, float, float, float]:
+    def _generate_random_streams(self) -> dict[str, np.ndarray]:
+        """Pre-draw random numbers reused across metric evaluations."""
+        component_uniform = self.rng.random((8, self.mc_samples)).astype(np.float32, copy=False)
+        feeder_uniform = self.rng.random((3, 2, self.mc_samples)).astype(np.float32, copy=False)
+        repair_normals = self.rng.standard_normal((8, self.mc_samples)).astype(np.float32, copy=False)
+        return {
+            "component_uniform": component_uniform,
+            "feeder_uniform": feeder_uniform,
+            "repair_normals": repair_normals,
+        }
+
+    def _compute_metrics(
+        self,
+        improvement_height: np.ndarray,
+        year: float,
+        random_cache: Optional[dict[str, np.ndarray]] = None,
+        *,
+        return_cache: bool = False,
+    ):
         if self._base_heights is None or self._base_durations is None:
             self._generate_hazard_samples()
 
@@ -441,26 +459,23 @@ class TrialEnv(gym.Env):
         samples = self._base_heights + offset
         durations = self._base_durations
 
-        # Nearest-neighbour lookup helper using precomputed arrays
-        def nn_lookup(values_array: np.ndarray, query_inputs: np.ndarray) -> np.ndarray:
-            idx = np.searchsorted(self.input_grid, query_inputs, side='left')
-            idx_right = np.clip(idx, 0, len(self.input_grid) - 1)
-            idx_left = np.clip(idx - 1, 0, len(self.input_grid) - 1)
-            choose_left = (idx_right == 0) | (
-                (idx_right < len(self.input_grid)) & (np.abs(query_inputs - self.input_grid[idx_left]) <= np.abs(query_inputs - self.input_grid[idx_right]))
-            )
-            nearest_idx = np.where(choose_left, idx_left, idx_right)
-            return values_array[nearest_idx]
+        grid = self.input_grid
+        idx = np.searchsorted(grid, samples, side='left')
+        idx_right = np.clip(idx, 0, grid.size - 1)
+        idx_left = np.clip(idx - 1, 0, grid.size - 1)
+        choose_left = (idx <= 0) | (
+            np.abs(samples - grid[idx_left]) <= np.abs(samples - grid[idx_right])
+        )
+        nearest_idx = np.where(choose_left, idx_left, idx_right)
 
-        # Per-component hazard depths from cached CSV rows
-        depth_PV    = nn_lookup(self.depth_vals['PV'],          samples)
-        depth_sub1  = nn_lookup(self.depth_vals['Substation1'], samples)
-        depth_sub2  = nn_lookup(self.depth_vals['Substation2'], samples)
-        depth_comp1 = nn_lookup(self.depth_vals['Compressor1'], samples)
-        depth_comp2 = nn_lookup(self.depth_vals['Compressor2'], samples)
-        depth_comp3 = nn_lookup(self.depth_vals['Compressor3'], samples)
-        depth_therm = nn_lookup(self.depth_vals['ThermalUnit'], samples)
-        depth_LNG   = nn_lookup(self.depth_vals['LNG'],         samples)
+        depth_PV = self.depth_vals['PV'][nearest_idx]
+        depth_sub1 = self.depth_vals['Substation1'][nearest_idx]
+        depth_sub2 = self.depth_vals['Substation2'][nearest_idx]
+        depth_comp1 = self.depth_vals['Compressor1'][nearest_idx]
+        depth_comp2 = self.depth_vals['Compressor2'][nearest_idx]
+        depth_comp3 = self.depth_vals['Compressor3'][nearest_idx]
+        depth_therm = self.depth_vals['ThermalUnit'][nearest_idx]
+        depth_LNG = self.depth_vals['LNG'][nearest_idx]
 
         # Convert depths to fragilities via component-specific curves
         PV_fragility = np.clip(fragility_PV(depth_PV,    improvement_height[0]), 0.0, 1.0)
@@ -472,15 +487,15 @@ class TrialEnv(gym.Env):
         thermal_unit_fragility = np.clip(fragility_thermal_unit(depth_therm, improvement_height[6]), 0.0, 1.0)
         LNG_terminal_fragility = np.clip(fragility_LNG_terminal(depth_LNG, improvement_height[7]), 0.0, 1.0)
 
-        # Vectorized Monte Carlo: 1 means operational, 0 means failed
-        U = self.rng.random((8, self.mc_samples))
-        PV_up         = (U[0] >= PV_fragility).astype(np.uint8)
-        substation_1  = (U[1] >= substation1_fragility).astype(np.uint8)
-        substation_2  = (U[2] >= substation2_fragility).astype(np.uint8)
-        compressor_1  = (U[3] >= compressor1_fragility).astype(np.uint8)
-        compressor_2  = (U[4] >= compressor2_fragility).astype(np.uint8)
-        compressor_3  = (U[5] >= compressor3_fragility).astype(np.uint8)
-        thermal_unit  = (U[6] >= thermal_unit_fragility).astype(np.uint8)
+        cache = random_cache if random_cache is not None else self._generate_random_streams()
+        U = cache["component_uniform"]
+        PV_up = (U[0] >= PV_fragility).astype(np.uint8)
+        substation_1 = (U[1] >= substation1_fragility).astype(np.uint8)
+        substation_2 = (U[2] >= substation2_fragility).astype(np.uint8)
+        compressor_1 = (U[3] >= compressor1_fragility).astype(np.uint8)
+        compressor_2 = (U[4] >= compressor2_fragility).astype(np.uint8)
+        compressor_3 = (U[5] >= compressor3_fragility).astype(np.uint8)
+        thermal_unit = (U[6] >= thermal_unit_fragility).astype(np.uint8)
         LNG_terminal_ = (U[7] >= LNG_terminal_fragility).astype(np.uint8)
 
         # Booleans for logic operations
@@ -493,23 +508,24 @@ class TrialEnv(gym.Env):
         therm_b = thermal_unit.astype(bool)
         LNG_b   = LNG_terminal_.astype(bool)
 
-        # === Repair times (hours or days depending on the function) ===
-        # Vectorize the repair time functions to accept numpy arrays
-        pv_rt_fn = np.vectorize(lambda d: pv_repair_time(d, rng=self.rng), otypes=[np.float32])
-        sub_rt_fn = np.vectorize(lambda d: substation_repair_time(d, rng=self.rng), otypes=[np.float32])
-        comp_rt_fn = np.vectorize(lambda d: compressor_repair_time(d, rng=self.rng), otypes=[np.float32])
-        therm_rt_fn = np.vectorize(lambda d: thermal_unit_repair_time(d, rng=self.rng), otypes=[np.float32])
-        LNG_rt_fn = np.vectorize(lambda d: LNG_repair_time(d, rng=self.rng), otypes=[np.float32])
+        normals = cache["repair_normals"]
+        repair_PV_samples = pv_repair_time(depth_PV, rng=self.rng, normals=normals[0])
+        repair_sub1_samples = substation_repair_time(depth_sub1, rng=self.rng, normals=normals[1])
+        repair_sub2_samples = substation_repair_time(depth_sub2, rng=self.rng, normals=normals[2])
+        repair_comp1_samples = compressor_repair_time(depth_comp1, rng=self.rng, normals=normals[3])
+        repair_comp2_samples = compressor_repair_time(depth_comp2, rng=self.rng, normals=normals[4])
+        repair_comp3_samples = compressor_repair_time(depth_comp3, rng=self.rng, normals=normals[5])
+        repair_therm_samples = thermal_unit_repair_time(depth_therm, rng=self.rng, normals=normals[6])
+        repair_LNG_samples = LNG_repair_time(depth_LNG, rng=self.rng, normals=normals[7])
 
-        # Sample repair times (exclude flood duration for sequential restoration logic)
-        repair_PV    = np.where(~PV_b,    pv_rt_fn(depth_PV),    0.0).astype(np.float32)
-        repair_sub1  = np.where(~sub1_b,  sub_rt_fn(depth_sub1), 0.0).astype(np.float32)
-        repair_sub2  = np.where(~sub2_b,  sub_rt_fn(depth_sub2), 0.0).astype(np.float32)
-        repair_comp1 = np.where(~comp1_b, comp_rt_fn(depth_comp1), 0.0).astype(np.float32)
-        repair_comp2 = np.where(~comp2_b, comp_rt_fn(depth_comp2), 0.0).astype(np.float32)
-        repair_comp3 = np.where(~comp3_b, comp_rt_fn(depth_comp3), 0.0).astype(np.float32)
-        repair_therm = np.where(~therm_b, therm_rt_fn(depth_therm), 0.0).astype(np.float32)
-        repair_LNG   = np.where(~LNG_b,   LNG_rt_fn(depth_LNG),   0.0).astype(np.float32)
+        repair_PV = np.where(~PV_b, repair_PV_samples, 0.0).astype(np.float32)
+        repair_sub1 = np.where(~sub1_b, repair_sub1_samples, 0.0).astype(np.float32)
+        repair_sub2 = np.where(~sub2_b, repair_sub2_samples, 0.0).astype(np.float32)
+        repair_comp1 = np.where(~comp1_b, repair_comp1_samples, 0.0).astype(np.float32)
+        repair_comp2 = np.where(~comp2_b, repair_comp2_samples, 0.0).astype(np.float32)
+        repair_comp3 = np.where(~comp3_b, repair_comp3_samples, 0.0).astype(np.float32)
+        repair_therm = np.where(~therm_b, repair_therm_samples, 0.0).astype(np.float32)
+        repair_LNG = np.where(~LNG_b, repair_LNG_samples, 0.0).astype(np.float32)
         flood_duration = durations.astype(np.float32)
 
         # Source services
@@ -521,12 +537,13 @@ class TrialEnv(gym.Env):
         p_feeder_avail_c1 = 0.8
         p_feeder_avail_c2 = 0.8
         p_feeder_avail_c3 = 0.8
-        feed_s1_c1 = (self.rng.random(self.mc_samples) < p_feeder_avail_c1)
-        feed_s2_c1 = (self.rng.random(self.mc_samples) < p_feeder_avail_c1)
-        feed_s1_c2 = (self.rng.random(self.mc_samples) < p_feeder_avail_c2)
-        feed_s2_c2 = (self.rng.random(self.mc_samples) < p_feeder_avail_c2)
-        feed_s1_c3 = (self.rng.random(self.mc_samples) < p_feeder_avail_c3)
-        feed_s2_c3 = (self.rng.random(self.mc_samples) < p_feeder_avail_c3)
+        feeder_uniform = cache["feeder_uniform"]
+        feed_s1_c1 = feeder_uniform[0, 0] < p_feeder_avail_c1
+        feed_s2_c1 = feeder_uniform[0, 1] < p_feeder_avail_c1
+        feed_s1_c2 = feeder_uniform[1, 0] < p_feeder_avail_c2
+        feed_s2_c2 = feeder_uniform[1, 1] < p_feeder_avail_c2
+        feed_s1_c3 = feeder_uniform[2, 0] < p_feeder_avail_c3
+        feed_s2_c3 = feeder_uniform[2, 1] < p_feeder_avail_c3
 
         sub1_service = sub1_b & False
         for _ in range(10):
@@ -600,12 +617,15 @@ class TrialEnv(gym.Env):
         elec_loss_mean = float(electricity_loss_samples.mean())
         gas_social_mean = float(gas_social_samples.mean())
         elec_social_mean = float(electricity_social_samples.mean())
-        return (
+        metrics = (
             gas_loss_mean,
             elec_loss_mean,
             gas_social_mean,
             elec_social_mean,
         )
+        if return_cache:
+            return metrics, cache
+        return metrics
 
     def _compute_loss(self, metrics: tuple[float, float, float, float]) -> float:
         gas_loss, elec_loss, gas_social, elec_social = metrics
@@ -732,10 +752,16 @@ class TrialEnv(gym.Env):
         self._set_weight_index(idx)
         prev_loss = self._compute_loss(self._prev_metrics)
 
-        rng_state = self.rng.bit_generator.state
-        base_metrics = self._compute_metrics(prev_improvement, year=current_year)
-        self.rng.bit_generator.state = rng_state
-        new_metrics = self._compute_metrics(post_improvement, year=current_year)
+        base_metrics, random_cache = self._compute_metrics(
+            prev_improvement,
+            year=current_year,
+            return_cache=True,
+        )
+        new_metrics = self._compute_metrics(
+            post_improvement,
+            year=current_year,
+            random_cache=random_cache,
+        )
 
         (
             base_gas_loss,

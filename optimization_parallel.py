@@ -13,8 +13,8 @@ import pandas as pd
 import gymnasium as gym
 
 # -------------------- User parameters --------------------
-SCENARIO_NAME = "neutral"  # decision-maker preferences
-CLIMATE_SCENARIO = "SSP1-1.9" # sea level rise projections
+SCENARIO_NAME = "neutral"  # decision-maker preferences (see DM_Scenarios.csv for available labels)
+CLIMATE_SCENARIO = "SSP5-8.5"  # sea level rise projections (keys from Projections.csv or "All" to sample each episode)
 BUDGET = 500000
 MC_SAMPLES = 50000
 
