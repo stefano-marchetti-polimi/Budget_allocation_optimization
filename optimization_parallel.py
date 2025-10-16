@@ -13,6 +13,7 @@ import pandas as pd
 import gymnasium as gym
 
 SCENARIO_NAME = "neutral"  # decision-maker preferences
+CLIMATE_SCENARIO = "SSP1-1.9" # sea level rise projections
 
 #CAN TRY GAE_LAMBDA = 0.9 OR LARGER CRITIC NETWORK OR DIFFERENT LEARNING RATE IF EXPLAINED VARIANCE IS STILL LOW/NEGATIVE 
 
@@ -38,6 +39,8 @@ from stable_baselines3.common.callbacks import (
 from utils.environment_placeholder import TrialEnv  # must be importable at top level
 
 WEIGHT_VECTOR_KEYS = ("W_g", "W_e", "W_ge", "W_gs", "W_ee", "W_es")
+
+_NORMAL_95_Z = 1.6448536269514722  # z-score for the 95th percentile of the standard normal
 
 
 def load_dm_weight_schedule(csv_path: str, scenario: str, years: int, year_step: int) -> tuple[np.ndarray, list[int]]:
@@ -97,6 +100,101 @@ def load_dm_weight_schedule(csv_path: str, scenario: str, years: int, year_step:
     decision_years = [int(float(col)) for col in selected_cols]
     return schedule, decision_years
 
+
+def load_sea_level_scenarios(
+    csv_path: str,
+    years: int,
+    year_step: int,
+) -> tuple[dict[str, dict[str, np.ndarray]], list[int]]:
+    """Load truncated-normal parameters for sea level deltas per scenario and decision step."""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Sea level projection file not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    df.columns = [col.strip() for col in df.columns]
+
+    required_cols = {"scenario", "quantile"}
+    if not required_cols.issubset(df.columns):
+        raise ValueError(f"Sea level CSV must include columns: {sorted(required_cols)}")
+
+    df["scenario"] = df["scenario"].astype(str).str.strip()
+    df["quantile"] = pd.to_numeric(df["quantile"], errors="coerce")
+    if df["quantile"].isna().any():
+        raise ValueError("Sea level CSV contains non-numeric quantile entries.")
+
+    metadata_cols = {"lon", "lat", "process", "confidence", "scenario", "quantile"}
+    value_cols = [col for col in df.columns if col not in metadata_cols]
+    if not value_cols:
+        raise ValueError("Sea level CSV does not contain any projection columns.")
+
+    try:
+        year_pairs = sorted(
+            ((col, int(float(col)))) for col in value_cols if str(col).strip()
+        )
+    except ValueError as exc:
+        raise ValueError("Projection column headers must be numeric years.") from exc
+
+    if not year_pairs:
+        raise ValueError("Sea level CSV does not contain valid numeric year columns.")
+
+    n_steps = math.ceil(years / year_step)
+    required_points = n_steps + 1
+    if len(year_pairs) < required_points:
+        raise ValueError(
+            f"Sea level CSV provides {len(year_pairs)} year columns; "
+            f"{required_points} are required for {years} years with step {year_step}."
+        )
+
+    selected_pairs = year_pairs[: required_points]
+    selected_cols = [name for name, _ in selected_pairs]
+    decision_years = [year for _, year in selected_pairs]
+
+    needed_quantiles = {5, 50, 95}
+    scenario_params: dict[str, dict[str, np.ndarray]] = {}
+
+    for scenario_name, scenario_df in df.groupby("scenario"):
+        pivot = (
+            scenario_df.drop_duplicates(subset=["quantile"])
+            .set_index("quantile")[selected_cols]
+            .apply(pd.to_numeric, errors="coerce")
+        )
+        missing = needed_quantiles - set(pivot.index)
+        if missing:
+            raise ValueError(
+                f"Scenario '{scenario_name}' missing quantiles {sorted(missing)} "
+                f"in projection file."
+            )
+
+        if pivot[selected_cols].isna().any().any():
+            raise ValueError(
+                f"Scenario '{scenario_name}' contains NaNs in the selected projection years."
+            )
+
+        q5 = pivot.loc[5].to_numpy(dtype=np.float32)
+        q50 = pivot.loc[50].to_numpy(dtype=np.float32)
+        q95 = pivot.loc[95].to_numpy(dtype=np.float32)
+
+        if np.any(q95 < q5):
+            raise ValueError(
+                f"Scenario '{scenario_name}' has 95th percentile below 5th percentile."
+            )
+
+        spread = np.maximum(q95 - q5, 1e-6)
+        sigma = spread / (2.0 * _NORMAL_95_Z)
+
+        scenario_params[scenario_name] = {
+            "mu": q50.astype(np.float32),
+            "sigma": sigma.astype(np.float32),
+            "lower": q5.astype(np.float32),
+            "upper": q95.astype(np.float32),
+        }
+
+    if not scenario_params:
+        raise ValueError("No scenarios were parsed from the sea level projection file.")
+
+    return scenario_params, decision_years
+
+
 # -------------------- User parameters --------------------
 num_nodes = 8
 years = 75 # until 2100
@@ -114,6 +212,13 @@ weights_schedule, weight_years = load_dm_weight_schedule(
     year_step,
 )
 
+SEA_LEVEL_PROJECTIONS_PATH = os.path.join("Sea Level Projections", "Projections.csv")
+sea_level_scenarios, _ = load_sea_level_scenarios(
+    SEA_LEVEL_PROJECTIONS_PATH,
+    years,
+    year_step,
+)
+
 env_kwargs = dict(
     num_nodes=num_nodes,
     years=years,
@@ -126,6 +231,8 @@ env_kwargs = dict(
     max_depth=8.0,
     threshold_depth=0.5,
     weight_years=weight_years,
+    sea_level_scenarios=sea_level_scenarios,
+    climate_scenario=CLIMATE_SCENARIO,
 )
 
 RESULTS_DIR = "results"

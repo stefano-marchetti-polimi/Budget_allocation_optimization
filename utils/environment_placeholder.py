@@ -1,7 +1,7 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 import pandas as pd
 from utils.fragility_curves import (
     fragility_PV,
@@ -45,7 +45,9 @@ class TrialEnv(gym.Env):
         max_depth: float = 8.0,
         max_duration: float = 100,
         threshold_depth: float = 0.5,
-        rise_rate : float = 0.02,
+        rise_rate: float = 0.02,
+        sea_level_scenarios: Optional[Mapping[str, Mapping[str, np.ndarray]]] = None,
+        climate_scenario: str = "All",
         normalize_observations: bool = True,
         maximum_repair_time: float = 40.75,
         repeat_asset_penalty: float = -1.0,
@@ -101,6 +103,50 @@ class TrialEnv(gym.Env):
             self._weight_base_year = int(weight_years_array[0])
 
         self.rise_rate = float(rise_rate)
+        self._decision_points = required_points
+        self._num_decision_steps = max(self._decision_points - 1, 0)
+        self._sea_level_offsets: Optional[np.ndarray] = None
+        self._sea_level_deltas: Optional[np.ndarray] = None
+        self._active_climate_scenario: Optional[str] = None
+        self._climate_scenario_selected: Optional[str] = None
+        if sea_level_scenarios is not None:
+            if not isinstance(sea_level_scenarios, Mapping) or not sea_level_scenarios:
+                raise ValueError("sea_level_scenarios must be a non-empty mapping when provided.")
+            expected_len = self._decision_points
+            scenario_map: dict[str, dict[str, np.ndarray]] = {}
+            for name, params in sea_level_scenarios.items():
+                if not isinstance(params, Mapping):
+                    raise ValueError(f"Sea level parameters for scenario '{name}' must be a mapping.")
+                processed: dict[str, np.ndarray] = {}
+                for key in ("mu", "sigma", "lower", "upper"):
+                    if key not in params:
+                        raise ValueError(f"Scenario '{name}' missing '{key}' entries.")
+                    arr = np.asarray(params[key], dtype=np.float32).reshape(-1)
+                    if arr.size != expected_len:
+                        raise ValueError(
+                            f"Scenario '{name}' expected {expected_len} entries for '{key}', received {arr.size}."
+                        )
+                    if key == "sigma" and np.any(arr < 0.0):
+                        raise ValueError(f"Scenario '{name}' contains negative sigma values.")
+                    arr_copy = arr.copy()
+                    arr_copy.setflags(write=False)
+                    processed[key] = arr_copy
+                scenario_map[str(name)] = processed
+            if not scenario_map:
+                raise ValueError("sea_level_scenarios mapping is empty.")
+            preference = str(climate_scenario).strip()
+            if not preference:
+                raise ValueError("climate_scenario must be a non-empty string.")
+            if preference != "All" and preference not in scenario_map:
+                available = sorted(scenario_map.keys())
+                raise ValueError(
+                    f"climate_scenario '{preference}' not found in available scenarios: {available}"
+                )
+            self._sea_level_scenarios = scenario_map
+            self._climate_scenario_selected = preference
+        else:
+            self._sea_level_scenarios = None
+            self._climate_scenario_selected = None
         self.maximum_repair_time = float(maximum_repair_time)
         self.repeat_asset_penalty = float(repeat_asset_penalty)
         self.max_duration = float(max_duration)
@@ -282,6 +328,85 @@ class TrialEnv(gym.Env):
         costs = self.cost_prefactor * np.power(non_negative, self.beta)
         return costs.astype(np.float32)
 
+    def _sample_truncated_normal(self, mu: float, sigma: float, lower: float, upper: float) -> np.float32:
+        """Sample from a truncated normal via simple rejection sampling."""
+        low = float(lower)
+        high = float(upper)
+        if low > high:
+            low, high = high, low
+        if not np.isfinite(mu):
+            mu = 0.0
+        if sigma <= 0.0 or not np.isfinite(sigma):
+            return np.float32(np.clip(mu, low, high))
+        for _ in range(64):
+            draw = float(self.rng.normal(mu, sigma))
+            if low <= draw <= high:
+                return np.float32(draw)
+        return np.float32(np.clip(mu, low, high))
+
+    def _sample_sea_level_path(self) -> None:
+        """Sample cumulative sea level offsets for the upcoming episode."""
+        if self._sea_level_scenarios is None:
+            self._sea_level_offsets = None
+            self._sea_level_deltas = None
+            self._active_climate_scenario = None
+            return
+
+        preference = self._climate_scenario_selected or "All"
+        if preference == "All":
+            scenario_name = str(self.rng.choice(list(self._sea_level_scenarios.keys())))
+        else:
+            scenario_name = preference
+
+        params = self._sea_level_scenarios[scenario_name]
+        mu = params["mu"]
+        sigma = params["sigma"]
+        lower = params["lower"]
+        upper = params["upper"]
+        n_points = mu.shape[0]
+        levels = np.empty(n_points, dtype=np.float32)
+        prev_value: Optional[float] = None
+        for idx in range(n_points):
+            low = float(lower[idx])
+            high = float(upper[idx])
+            if prev_value is not None:
+                low = max(low, prev_value)
+            if high < low:
+                high = low
+            sampled = float(
+                self._sample_truncated_normal(
+                    float(mu[idx]),
+                    float(sigma[idx]),
+                    low,
+                    high,
+                )
+            )
+            if prev_value is not None and sampled < prev_value:
+                sampled = prev_value
+            levels[idx] = np.float32(sampled)
+            prev_value = sampled
+
+        base_level = levels[0]
+        offsets = (levels - base_level).astype(np.float32)
+        if offsets.size <= 1:
+            deltas = np.zeros(0, dtype=np.float32)
+        else:
+            deltas = np.diff(offsets).astype(np.float32)
+
+        self._sea_level_deltas = deltas
+        self._sea_level_offsets = offsets
+        self._active_climate_scenario = scenario_name
+
+    def _sea_level_offset_for_year(self, year: float) -> np.float32:
+        """Return the cumulative sea level adjustment for the provided elapsed year."""
+        if self._sea_level_offsets is None:
+            return np.float32(year * self.rise_rate)
+        if self.year_step <= 0:
+            return np.float32(self._sea_level_offsets[-1])
+        idx = int(np.floor(year / self.year_step))
+        idx = max(0, min(idx, self._sea_level_offsets.shape[0] - 1))
+        return np.float32(self._sea_level_offsets[idx])
+
     def _generate_hazard_samples(self) -> None:
         """Draw and cache the Monte Carlo flood samples reused across the episode."""
         seed_val = int(self.rng.integers(0, 2**31 - 1))
@@ -309,7 +434,8 @@ class TrialEnv(gym.Env):
             self._generate_hazard_samples()
 
         improvement_height = np.asarray(improvement_height, dtype=np.float32)
-        samples = self._base_heights + np.float32(year * self.rise_rate)
+        offset = self._sea_level_offset_for_year(year)
+        samples = self._base_heights + offset
         durations = self._base_durations
 
         # Nearest-neighbour lookup helper using precomputed arrays
@@ -525,6 +651,7 @@ class TrialEnv(gym.Env):
         self.improvement_height = np.zeros(self.N, dtype=np.float32)
         self._year = 0
         self._set_weight_index(0)
+        self._sample_sea_level_path()
         self._base_heights = None
         self._base_durations = None
         metrics = self._compute_metrics(self.improvement_height, year=self._year)
@@ -539,7 +666,11 @@ class TrialEnv(gym.Env):
         self._last_positive_mask = np.zeros(self.N, dtype=bool)
         self._prev_metrics = metrics
         self._prev_loss = self._compute_loss(metrics)
-        return self._obs(), {}
+        info = {}
+        if self._active_climate_scenario is not None and self._sea_level_offsets is not None:
+            info["climate_scenario"] = self._active_climate_scenario
+            info["sea_level_offset"] = float(self._sea_level_offsets[0])
+        return self._obs(), info
 
     def step(self, action):
         # Improvements are wall-height increments chosen from discrete levels per component.
@@ -584,6 +715,7 @@ class TrialEnv(gym.Env):
         self._last_positive_mask = executed_heights > 0.0
         self._year += self.year_step
         current_year = self._year
+        sea_level_step_index = current_year // self.year_step if self.year_step > 0 else 0
         if self._weight_years is not None:
             target_year = self._weight_base_year + current_year
             idx = int(np.searchsorted(self._weight_years, target_year, side="right") - 1)
@@ -653,6 +785,13 @@ class TrialEnv(gym.Env):
             "climate_drift": float(climate_drift),
             "action_gain": float(action_gain),
         }
+        if self._active_climate_scenario is not None:
+            info["climate_scenario"] = self._active_climate_scenario
+            info["sea_level_offset"] = float(self._sea_level_offset_for_year(current_year))
+            if self._sea_level_deltas is not None:
+                delta_idx = sea_level_step_index - 1
+                if 0 <= delta_idx < self._sea_level_deltas.shape[0]:
+                    info["sea_level_delta"] = float(self._sea_level_deltas[delta_idx])
         if repeat_count:
             info["repeat_penalty"] = float(repeat_penalty_total)
             info["repeat_penalty_assets"] = [int(i) for i in np.nonzero(repeat_mask)[0]]

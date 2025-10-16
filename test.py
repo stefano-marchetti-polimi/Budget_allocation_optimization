@@ -232,6 +232,9 @@ def save_logs(
     df.to_csv(os.path.join(RESULTS_DIR, "evaluation_logs.csv"), index=False)
 
     years_axis = [i * year_step for i in range(len(actions_log))]
+    sea_level_offsets = [info.get("sea_level_offset", None) for info in infos_log]
+    sea_level_deltas = [info.get("sea_level_delta", None) for info in infos_log]
+    active_scenario = infos_log[0].get("climate_scenario") if infos_log else None
 
     fig, axes = plt.subplots(
         actions_arr.shape[1],
@@ -304,6 +307,32 @@ def save_logs(
     plt.tight_layout()
     plt.savefig(os.path.join(RESULTS_DIR, "reward_over_time.png"))
     plt.close()
+
+    if any(offset is not None for offset in sea_level_offsets):
+        plt.figure(figsize=(10, 4))
+        offset_values = [
+            float(offset) if offset is not None else None for offset in sea_level_offsets
+        ]
+        if offset_values and offset_values[0] is not None:
+            offset_values = offset_values[: len(years_axis)]
+            plt.plot(years_axis, offset_values, marker="o", linewidth=1.5, label="Sea level")
+        if any(delta is not None for delta in sea_level_deltas):
+            delta_years = years_axis[1:]
+            delta_values = [
+                float(delta) if delta is not None else None for delta in sea_level_deltas[1:]
+            ]
+            plt.step(delta_years, delta_values, where="post", linestyle="--", linewidth=1.2, label="Delta")
+        plt.xlabel("Year")
+        plt.ylabel("Sea level (m)")
+        title = "Sea Level Path"
+        if active_scenario:
+            title += f" ({active_scenario})"
+        plt.title(title)
+        plt.grid(True, axis="both", alpha=0.3)
+        plt.legend(loc="best")
+        plt.tight_layout()
+        plt.savefig(os.path.join(RESULTS_DIR, "sea_level_over_time.png"))
+        plt.close()
 
 
 def main() -> None:
