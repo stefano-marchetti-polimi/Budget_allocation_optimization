@@ -1,7 +1,7 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from typing import Optional
+from typing import Optional, Sequence
 import pandas as pd
 from utils.fragility_curves import (
     fragility_PV,
@@ -31,7 +31,8 @@ class TrialEnv(gym.Env):
         self,
         num_nodes: int,
         years: int = 50,
-        weights: list = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        weights: Sequence[float] = (0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
+        weight_years: Optional[Sequence[int]] = None,
         cost_per_meter: float = 10000.0,
         budget: float = 100000.0,
         year_step: int = 1,
@@ -58,7 +59,47 @@ class TrialEnv(gym.Env):
         self.T = int(years)
         self.budget = float(budget)
         self.year_step = int(year_step)
-        self.weights = weights
+        weights_array = np.asarray(weights, dtype=np.float32)
+        if weights_array.ndim == 1:
+            if weights_array.shape[0] != 6:
+                raise ValueError(f"weights must contain 6 entries, received shape {weights_array.shape}.")
+            weights_array = weights_array.reshape(1, -1)
+        elif weights_array.ndim == 2:
+            if weights_array.shape[1] != 6:
+                raise ValueError(
+                    f"Weight schedule must provide 6 entries per step, received shape {weights_array.shape}."
+                )
+        else:
+            raise ValueError("weights must be a 1D sequence of length 6 or a 2D schedule with 6 columns.")
+
+        if np.isnan(weights_array).any():
+            raise ValueError("Weight schedule contains NaN values.")
+
+        required_points = ((self.T + self.year_step - 1) // self.year_step) + 1
+        if weights_array.shape[0] < required_points:
+            raise ValueError(
+                f"Weight schedule length {weights_array.shape[0]} insufficient for "
+                f"{self.T} years with step {self.year_step}."
+            )
+
+        self._weight_schedule = weights_array.astype(np.float32)
+        self._current_weight_index = 0
+        self.weights = self._weight_schedule[0].copy()
+
+        self._weight_years = None
+        self._weight_base_year = 0
+        if weight_years is not None:
+            weight_years_array = np.asarray(list(weight_years), dtype=np.int64)
+            if weight_years_array.shape[0] != self._weight_schedule.shape[0]:
+                raise ValueError(
+                    f"weight_years length {weight_years_array.shape[0]} "
+                    f"does not match weight schedule length {self._weight_schedule.shape[0]}."
+                )
+            if weight_years_array.shape[0] > 1 and np.any(np.diff(weight_years_array) < 0):
+                raise ValueError("weight_years must be sorted in non-decreasing order.")
+            self._weight_years = weight_years_array
+            self._weight_base_year = int(weight_years_array[0])
+
         self.rise_rate = float(rise_rate)
         self.maximum_repair_time = float(maximum_repair_time)
         self.repeat_asset_penalty = float(repeat_asset_penalty)
@@ -217,6 +258,19 @@ class TrialEnv(gym.Env):
         self._base_durations: Optional[np.ndarray] = None
         self._prev_metrics: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
         self._prev_loss: float = 0.0
+
+    def _set_weight_index(self, index: int) -> None:
+        """Update the active weight vector according to the schedule."""
+        if self._weight_schedule.shape[0] == 0:
+            raise ValueError("Weight schedule is empty.")
+        max_idx = self._weight_schedule.shape[0] - 1
+        safe_index = int(index)
+        if safe_index < 0:
+            safe_index = 0
+        elif safe_index > max_idx:
+            safe_index = max_idx
+        self._current_weight_index = safe_index
+        self.weights = self._weight_schedule[safe_index]
 
     # ------------------------
     # Helper computations
@@ -470,6 +524,7 @@ class TrialEnv(gym.Env):
         self.wall_height = self.initial_wall_height.copy()
         self.improvement_height = np.zeros(self.N, dtype=np.float32)
         self._year = 0
+        self._set_weight_index(0)
         self._base_heights = None
         self._base_durations = None
         metrics = self._compute_metrics(self.improvement_height, year=self._year)
@@ -529,6 +584,13 @@ class TrialEnv(gym.Env):
         self._last_positive_mask = executed_heights > 0.0
         self._year += self.year_step
         current_year = self._year
+        if self._weight_years is not None:
+            target_year = self._weight_base_year + current_year
+            idx = int(np.searchsorted(self._weight_years, target_year, side="right") - 1)
+        else:
+            idx = current_year // self.year_step
+        self._set_weight_index(idx)
+        prev_loss = self._compute_loss(self._prev_metrics)
 
         rng_state = self.rng.bit_generator.state
         base_metrics = self._compute_metrics(prev_improvement, year=current_year)
@@ -548,7 +610,6 @@ class TrialEnv(gym.Env):
             new_elec_soc,
         ) = new_metrics
 
-        prev_loss = self._prev_loss
         base_loss = self._compute_loss(base_metrics)
         new_loss = self._compute_loss(new_metrics)
         climate_drift = base_loss - prev_loss
