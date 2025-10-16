@@ -20,10 +20,11 @@ class TrialEnv(gym.Env):
     At each decision step the agent chooses wall-height increments for every component from
     the discrete set {0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0} meters. Positive choices incur
     component-specific construction costs; if their sum exceeds the yearly budget, the most
-    expensive upgrades are dropped until the action is feasible and a penalty is applied.
-    Reapplying an upgrade to the same component on consecutive steps is cancelled and
-    penalised. Consecutive no-investment decisions are also discouraged with a penalty.
-    Observations can optionally be normalised to lie in [0, 1].
+    expensive upgrades are dropped until the action is feasible. Reapplying an upgrade to the
+    same component on consecutive steps is cancelled and penalised. Observations can optionally
+    be normalised to lie in [0, 1]. The reward is shaped as the reduction in expected losses due
+    to the action minus a normalized cost term, so inaction while sea level rises naturally
+    incurs a penalty through worsening impacts.
     """
 
     def __init__(
@@ -37,7 +38,7 @@ class TrialEnv(gym.Env):
         initial_wall_height = None,
         area = None,
         seed: Optional[int] = None,
-        mc_samples: int = 200_000,
+        mc_samples: int = 500_000,
         csv_path: str = 'outputs/coastal_inundation_samples.csv',
         copula_theta: float = 3.816289,
         max_depth: float = 8.0,
@@ -47,8 +48,8 @@ class TrialEnv(gym.Env):
         normalize_observations: bool = True,
         maximum_repair_time: float = 40.75,
         repeat_asset_penalty: float = -1.0,
-        repeat_noop_penalty: float = -8.0,
-        over_budget_penalty: float = -5.0,
+        reward_scale: float = 5000.0,
+        cost_weight: float = 2.0,
     ):
         super().__init__()
         assert num_nodes >= 1, "num_nodes must be >= 1"
@@ -61,9 +62,9 @@ class TrialEnv(gym.Env):
         self.rise_rate = float(rise_rate)
         self.maximum_repair_time = float(maximum_repair_time)
         self.repeat_asset_penalty = float(repeat_asset_penalty)
-        self.repeat_noop_penalty = float(repeat_noop_penalty)
-        self.over_budget_penalty = float(over_budget_penalty)
         self.max_duration = float(max_duration)
+        self.reward_scale = float(reward_scale)
+        self.cost_weight = float(cost_weight)
         # This environment currently models 8 components explicitly below
         assert num_nodes == 8, "num_nodes must be 8 to match the hardcoded component mapping (PV, 2 substations, 3 compressors, thermal, LNG)."
 
@@ -88,6 +89,61 @@ class TrialEnv(gym.Env):
             area_array = np.asarray(area, dtype=np.float32)
             assert area_array.shape == (self.N,), "area must have length N"
         self.area = area_array
+
+        # Placeholder supply/people values per compressor and substation (user can adjust later)
+        self.compressor_order = ["Compressor1", "Compressor2", "Compressor3"]
+        compressor_defaults = {
+            "Compressor1": {"gas_supply": 50.0, "people": 0.0},
+            "Compressor2": {"gas_supply": 35.0, "people": 10000.0},
+            "Compressor3": {"gas_supply": 25.0, "people": 0.0},
+        }
+        self.substation_order = ["Substation1", "Substation2"]
+        substation_defaults = {
+            "Substation1": {"power_supply": 70.0, "people": 0.0},
+            "Substation2": {"power_supply": 30.0, "people": 15000.0},
+        }
+
+        self.compressor_gas_supply = np.array(
+            [compressor_defaults[name]["gas_supply"] for name in self.compressor_order],
+            dtype=np.float32,
+        )
+        self.compressor_people = np.array(
+            [compressor_defaults[name]["people"] for name in self.compressor_order],
+            dtype=np.float32,
+        )
+        self.substation_power_supply = np.array(
+            [substation_defaults[name]["power_supply"] for name in self.substation_order],
+            dtype=np.float32,
+        )
+        self.substation_people = np.array(
+            [substation_defaults[name]["people"] for name in self.substation_order],
+            dtype=np.float32,
+        )
+
+        self.total_gas_supply = float(self.compressor_gas_supply.sum())
+        self.total_gas_people = float(self.compressor_people.sum())
+        self.total_power_supply = float(self.substation_power_supply.sum())
+        self.total_power_people = float(self.substation_people.sum())
+
+        if self.total_gas_supply > 0.0:
+            self.compressor_supply_fraction = (self.compressor_gas_supply / self.total_gas_supply).astype(np.float32)
+        else:
+            self.compressor_supply_fraction = np.zeros_like(self.compressor_gas_supply, dtype=np.float32)
+
+        if self.total_gas_people > 0.0:
+            self.compressor_people_fraction = (self.compressor_people / self.total_gas_people).astype(np.float32)
+        else:
+            self.compressor_people_fraction = np.zeros_like(self.compressor_people, dtype=np.float32)
+
+        if self.total_power_supply > 0.0:
+            self.substation_supply_fraction = (self.substation_power_supply / self.total_power_supply).astype(np.float32)
+        else:
+            self.substation_supply_fraction = np.zeros_like(self.substation_power_supply, dtype=np.float32)
+
+        if self.total_power_people > 0.0:
+            self.substation_people_fraction = (self.substation_people / self.total_power_people).astype(np.float32)
+        else:
+            self.substation_people_fraction = np.zeros_like(self.substation_people, dtype=np.float32)
 
         if initial_wall_height is None:
             self.initial_wall_height = np.zeros(self.N, dtype=np.float32)
@@ -129,12 +185,7 @@ class TrialEnv(gym.Env):
         self.elec_loss_mean = 0.0
         self.gas_soc_mean = 0.0
         self.elec_soc_mean = 0.0
-        self._prev_gas_loss_mean = 0.0
-        self._prev_elec_loss_mean = 0.0
-        self._prev_gas_soc_mean = 0.0
-        self._prev_elec_soc_mean = 0.0
         self._last_positive_mask = np.zeros(self.N, dtype=bool)
-        self._last_was_noop = False
 
         # --- Cache CSV and per-row values for fast nearest-neighbour lookup ---
         df_raw = pd.read_csv(self.csv_path, sep=None, engine='python', header=0, index_col=0)
@@ -162,6 +213,10 @@ class TrialEnv(gym.Env):
             for name, row in self.ROW_FOR_COMPONENT.items()
         }
         self.improvement_height = np.zeros(self.N, dtype=np.float32)
+        self._base_heights: Optional[np.ndarray] = None
+        self._base_durations: Optional[np.ndarray] = None
+        self._prev_metrics: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+        self._prev_loss: float = 0.0
 
     # ------------------------
     # Helper computations
@@ -173,30 +228,35 @@ class TrialEnv(gym.Env):
         costs = self.cost_prefactor * np.power(non_negative, self.beta)
         return costs.astype(np.float32)
 
-    def _compute_reward(self) -> tuple[float, float, float]:
-        # Sample joint (height, duration) via copula and enforce max depth by resampling
-        # Use a fresh pseudo-random seed derived from the environment RNG for reproducibility
+    def _generate_hazard_samples(self) -> None:
+        """Draw and cache the Monte Carlo flood samples reused across the episode."""
         seed_val = int(self.rng.integers(0, 2**31 - 1))
         df_cop = sample_flood(self.mc_samples, self.copula_theta, seed=seed_val)
-        samples = df_cop["height"].to_numpy(dtype=np.float32)
-        durations = df_cop["duration"].to_numpy(dtype=np.float32)  # currently unused in impacts
+        heights = df_cop["height"].to_numpy(dtype=np.float32)
+        durations = df_cop["duration"].to_numpy(dtype=np.float32)
 
-        # Resample any (height > max_depth) OR (duration > max_duration) until none remain
         resample_count = 0
         while True:
-            mask = (samples > self.max_depth) | (durations > self.max_duration)
+            mask = (heights > self.max_depth) | (durations > self.max_duration)
             if not np.any(mask) or resample_count > 10:
                 break
             n_bad = int(mask.sum())
-            df_res = sample_flood(n_bad, self.copula_theta, seed=None)
-            res_h = df_res["height"].to_numpy(dtype=np.float32)
-            res_d = df_res["duration"].to_numpy(dtype=np.float32)
-            samples[mask] = res_h
-            durations[mask] = res_d
+            resample_seed = int(self.rng.integers(0, 2**31 - 1))
+            df_res = sample_flood(n_bad, self.copula_theta, seed=resample_seed)
+            heights[mask] = df_res["height"].to_numpy(dtype=np.float32)
+            durations[mask] = df_res["duration"].to_numpy(dtype=np.float32)
             resample_count += 1
 
-        # Apply secular rise to sampled depths (do not add threshold again; copula height is assumed absolute)
-        samples = samples + np.float32(self._year * self.rise_rate)
+        self._base_heights = heights
+        self._base_durations = durations
+
+    def _compute_metrics(self, improvement_height: np.ndarray, year: float) -> tuple[float, float, float, float]:
+        if self._base_heights is None or self._base_durations is None:
+            self._generate_hazard_samples()
+
+        improvement_height = np.asarray(improvement_height, dtype=np.float32)
+        samples = self._base_heights + np.float32(year * self.rise_rate)
+        durations = self._base_durations
 
         # Nearest-neighbour lookup helper using precomputed arrays
         def nn_lookup(values_array: np.ndarray, query_inputs: np.ndarray) -> np.ndarray:
@@ -220,14 +280,14 @@ class TrialEnv(gym.Env):
         depth_LNG   = nn_lookup(self.depth_vals['LNG'],         samples)
 
         # Convert depths to fragilities via component-specific curves
-        PV_fragility = np.clip(fragility_PV(depth_PV,    self.improvement_height[0]), 0.0, 1.0)
-        substation1_fragility = np.clip(fragility_substation(depth_sub1, self.improvement_height[1]), 0.0, 1.0)
-        substation2_fragility = np.clip(fragility_substation(depth_sub2, self.improvement_height[2]), 0.0, 1.0)
-        compressor1_fragility = np.clip(fragility_compressor(depth_comp1, self.improvement_height[3]), 0.0, 1.0)
-        compressor2_fragility = np.clip(fragility_compressor(depth_comp2, self.improvement_height[4]), 0.0, 1.0)
-        compressor3_fragility = np.clip(fragility_compressor(depth_comp3, self.improvement_height[5]), 0.0, 1.0)
-        thermal_unit_fragility = np.clip(fragility_thermal_unit(depth_therm, self.improvement_height[6]), 0.0, 1.0)
-        LNG_terminal_fragility = np.clip(fragility_LNG_terminal(depth_LNG, self.improvement_height[7]), 0.0, 1.0)
+        PV_fragility = np.clip(fragility_PV(depth_PV,    improvement_height[0]), 0.0, 1.0)
+        substation1_fragility = np.clip(fragility_substation(depth_sub1, improvement_height[1]), 0.0, 1.0)
+        substation2_fragility = np.clip(fragility_substation(depth_sub2, improvement_height[2]), 0.0, 1.0)
+        compressor1_fragility = np.clip(fragility_compressor(depth_comp1, improvement_height[3]), 0.0, 1.0)
+        compressor2_fragility = np.clip(fragility_compressor(depth_comp2, improvement_height[4]), 0.0, 1.0)
+        compressor3_fragility = np.clip(fragility_compressor(depth_comp3, improvement_height[5]), 0.0, 1.0)
+        thermal_unit_fragility = np.clip(fragility_thermal_unit(depth_therm, improvement_height[6]), 0.0, 1.0)
+        LNG_terminal_fragility = np.clip(fragility_LNG_terminal(depth_LNG, improvement_height[7]), 0.0, 1.0)
 
         # Vectorized Monte Carlo: 1 means operational, 0 means failed
         U = self.rng.random((8, self.mc_samples))
@@ -239,12 +299,6 @@ class TrialEnv(gym.Env):
         compressor_3  = (U[5] >= compressor3_fragility).astype(np.uint8)
         thermal_unit  = (U[6] >= thermal_unit_fragility).astype(np.uint8)
         LNG_terminal_ = (U[7] >= LNG_terminal_fragility).astype(np.uint8)
-
-        # Consumers split
-        industrial_consumer_gas = 0.4
-        industrial_consumer_electricity = 0.7
-        residential_consumer_gas = 0.6
-        residential_consumer_electricity = 0.3
 
         # Booleans for logic operations
         PV_b  = PV_up.astype(bool)
@@ -264,26 +318,16 @@ class TrialEnv(gym.Env):
         therm_rt_fn = np.vectorize(lambda d: thermal_unit_repair_time(d, rng=self.rng), otypes=[np.float32])
         LNG_rt_fn = np.vectorize(lambda d: LNG_repair_time(d, rng=self.rng), otypes=[np.float32])
 
-        # Sample per-sample repair times only where the component failed; 0 otherwise
-        t_PV    = np.where(~PV_b,    pv_rt_fn(depth_PV)+durations,    0.0).astype(np.float32)
-        t_sub1  = np.where(~sub1_b,  sub_rt_fn(depth_sub1)+durations, 0.0).astype(np.float32)
-        t_sub2  = np.where(~sub2_b,  sub_rt_fn(depth_sub2)+durations, 0.0).astype(np.float32)
-        t_comp1 = np.where(~comp1_b, comp_rt_fn(depth_comp1)+durations, 0.0).astype(np.float32)
-        t_comp2 = np.where(~comp2_b, comp_rt_fn(depth_comp2)+durations, 0.0).astype(np.float32)
-        t_comp3 = np.where(~comp3_b, comp_rt_fn(depth_comp3)+durations, 0.0).astype(np.float32)
-        t_therm = np.where(~therm_b, therm_rt_fn(depth_therm)+durations, 0.0).astype(np.float32)
-        t_LNG   = np.where(~LNG_b,   LNG_rt_fn(depth_LNG)+durations,   0.0).astype(np.float32)
-
-        # Normalize all repair times by a fixed maximum (e.g., 1200) so they are in [0,1]
-        TIME_NORM = np.float32(1200.0)
-        t_PV    = (t_PV    / (TIME_NORM)).astype(np.float32)
-        t_sub1  = (t_sub1  / (TIME_NORM)).astype(np.float32)
-        t_sub2  = (t_sub2  / (TIME_NORM)).astype(np.float32)
-        t_comp1 = (t_comp1 / (TIME_NORM)).astype(np.float32)
-        t_comp2 = (t_comp2 / (TIME_NORM)).astype(np.float32)
-        t_comp3 = (t_comp3 / (TIME_NORM)).astype(np.float32)
-        t_therm = (t_therm / (TIME_NORM)).astype(np.float32)
-        t_LNG   = (t_LNG   / (TIME_NORM)).astype(np.float32)
+        # Sample repair times (exclude flood duration for sequential restoration logic)
+        repair_PV    = np.where(~PV_b,    pv_rt_fn(depth_PV),    0.0).astype(np.float32)
+        repair_sub1  = np.where(~sub1_b,  sub_rt_fn(depth_sub1), 0.0).astype(np.float32)
+        repair_sub2  = np.where(~sub2_b,  sub_rt_fn(depth_sub2), 0.0).astype(np.float32)
+        repair_comp1 = np.where(~comp1_b, comp_rt_fn(depth_comp1), 0.0).astype(np.float32)
+        repair_comp2 = np.where(~comp2_b, comp_rt_fn(depth_comp2), 0.0).astype(np.float32)
+        repair_comp3 = np.where(~comp3_b, comp_rt_fn(depth_comp3), 0.0).astype(np.float32)
+        repair_therm = np.where(~therm_b, therm_rt_fn(depth_therm), 0.0).astype(np.float32)
+        repair_LNG   = np.where(~LNG_b,   LNG_rt_fn(depth_LNG),   0.0).astype(np.float32)
+        flood_duration = durations.astype(np.float32)
 
         # Source services
         PV_service  = PV_b.copy()
@@ -324,57 +368,78 @@ class TrialEnv(gym.Env):
         industrial_elec_service = LNG_service & comp3_service & thermal_unit_service & sub1_service
         residential_elec_service = PV_service & sub2_service
 
-        ig = industrial_gas_service.astype(float)
-        rg = residential_gas_service.astype(float)
-        ie = industrial_elec_service.astype(float)
-        re = residential_elec_service.astype(float)
+        max_event_time = np.float32(self.max_duration + self.maximum_repair_time)
+        max_event_time = np.clip(max_event_time, a_min=np.float32(1e-6), a_max=None)
 
-        # === Service-level maximum repair times (if multiple components cause the outage, use the longest repair time) ===
-        # Gas (industrial): LNG + Comp1 + power chain (Sub1/Sub2/Thermal/Comp3)
-        t_max_ig = np.maximum.reduce([t_LNG, t_comp1, t_sub1, t_sub2, t_therm, t_comp3])
-        # Gas (residential): LNG + Comp2 + power chain (Sub1/Sub2/Thermal/Comp3)
-        t_max_rg = np.maximum.reduce([t_LNG, t_comp2, t_sub1, t_sub2, t_therm, t_comp3])
-        # Electricity (industrial): LNG + Comp3 + Thermal + Sub1
-        t_max_ie = np.maximum.reduce([t_LNG, t_comp3, t_therm, t_sub1])
-        # Electricity (residential): PV + Sub2
-        t_max_re = np.maximum.reduce([t_PV, t_sub2])
+        gas_services = np.stack([comp1_service, comp2_service, comp3_service])
+        gas_service_times = np.stack([
+            np.where(
+                ~industrial_gas_service,
+                flood_duration + repair_LNG + repair_comp1 + repair_sub1 + repair_sub2 + repair_therm + repair_comp3,
+                0.0,
+            ),
+            np.where(
+                ~residential_gas_service,
+                flood_duration + repair_LNG + repair_comp2 + repair_sub1 + repair_sub2 + repair_therm + repair_comp3,
+                0.0,
+            ),
+            np.where(
+                ~comp3_service,
+                flood_duration + repair_LNG + repair_comp3 + repair_sub1 + repair_sub2 + repair_therm,
+                0.0,
+            ),
+        ]).astype(np.float32)
+        gas_time_ratio = np.clip(gas_service_times / max_event_time, a_min=0.0, a_max=1.0)
+        gas_outage_fraction = np.logical_not(gas_services).astype(np.float32) * self.compressor_supply_fraction[:, None]
+        gas_loss_samples = (gas_outage_fraction * gas_time_ratio).sum(axis=0)
+        gas_social_fraction = np.logical_not(gas_services).astype(np.float32) * self.compressor_people_fraction[:, None]
+        gas_social_samples = (gas_social_fraction * gas_time_ratio).sum(axis=0)
 
-        # === Time-weighted losses and social impacts ===
-        # Multiply each outage indicator by the corresponding maximum repair time.
-        gas_loss_samples = (1.0 - ig) * industrial_consumer_gas * t_max_ig + (1.0 - rg) * residential_consumer_gas * t_max_rg
-        electricity_loss_samples = (1.0 - ie) * industrial_consumer_electricity * t_max_ie + (1.0 - re) * residential_consumer_electricity * t_max_re
-        gas_social_samples = (1.0 - rg) * t_max_rg
-        electricity_social_samples = (1.0 - re) * t_max_re
-
-        w_gas, w_electricity, w_gas_loss, w_gas_social, w_electricity_loss, w_electricity_social = self.weights
-
-        self.gas_loss_mean = float(gas_loss_samples.mean())
-        self.elec_loss_mean = float(electricity_loss_samples.mean())
-        self.gas_soc_mean = float(gas_social_samples.mean())
-        self.elec_soc_mean = float(electricity_social_samples.mean())
-
-        # Compute deltas (positive if impacts decreased)
-        d_gas_loss = self._prev_gas_loss_mean - self.gas_loss_mean
-        d_elec_loss = self._prev_elec_loss_mean - self.elec_loss_mean
-        d_gas_soc  = self._prev_gas_soc_mean - self.gas_soc_mean
-        d_elec_soc = self._prev_elec_soc_mean - self.elec_soc_mean
-
-        w_gas, w_electricity, w_gas_loss, w_gas_social, w_electricity_loss, w_electricity_social = self.weights
-        reward_mean = (
-            w_gas * (d_gas_loss * w_gas_loss + d_gas_soc * w_gas_social)
-            + w_electricity * (d_elec_loss * w_electricity_loss + d_elec_soc * w_electricity_social)
+        power_services = np.stack([industrial_elec_service, residential_elec_service])
+        power_service_times = np.stack([
+            np.where(
+                ~industrial_elec_service,
+                flood_duration + repair_LNG + repair_comp3 + repair_therm + repair_sub1,
+                0.0,
+            ),
+            np.where(
+                ~residential_elec_service,
+                flood_duration + repair_PV + repair_sub2,
+                0.0,
+            ),
+        ]).astype(np.float32)
+        power_time_ratio = np.clip(power_service_times / max_event_time, a_min=0.0, a_max=1.0)
+        power_outage_fraction = np.logical_not(power_services).astype(np.float32) * self.substation_supply_fraction[:, None]
+        electricity_loss_samples = (power_outage_fraction * power_time_ratio).sum(axis=0)
+        power_social_fraction = np.logical_not(power_services).astype(np.float32) * self.substation_people_fraction[:, None]
+        electricity_social_samples = (power_social_fraction * power_time_ratio).sum(axis=0)
+        gas_loss_mean = float(gas_loss_samples.mean())
+        elec_loss_mean = float(electricity_loss_samples.mean())
+        gas_social_mean = float(gas_social_samples.mean())
+        elec_social_mean = float(electricity_social_samples.mean())
+        return (
+            gas_loss_mean,
+            elec_loss_mean,
+            gas_social_mean,
+            elec_social_mean,
         )
 
-        # Update previous means for next step
-        self._prev_gas_loss_mean = self.gas_loss_mean
-        self._prev_elec_loss_mean = self.elec_loss_mean
-        self._prev_gas_soc_mean = self.gas_soc_mean
-        self._prev_elec_soc_mean = self.elec_soc_mean
-
-        econ_impact = self.gas_loss_mean + self.elec_loss_mean
-        social_impact = self.gas_soc_mean + self.elec_soc_mean
-
-        return reward_mean, econ_impact, social_impact
+    def _compute_loss(self, metrics: tuple[float, float, float, float]) -> float:
+        gas_loss, elec_loss, gas_social, elec_social = metrics
+        (
+            w_gas,
+            w_electricity,
+            w_gas_loss,
+            w_gas_social,
+            w_electricity_loss,
+            w_electricity_social,
+        ) = self.weights
+        return (
+            w_gas * (gas_loss * w_gas_loss + gas_social * w_gas_social)
+            + w_electricity * (
+                elec_loss * w_electricity_loss + elec_social * w_electricity_social
+            )
+        )
 
     def _obs(self) -> np.ndarray:
         if self.normalize_observations:
@@ -405,14 +470,20 @@ class TrialEnv(gym.Env):
         self.wall_height = self.initial_wall_height.copy()
         self.improvement_height = np.zeros(self.N, dtype=np.float32)
         self._year = 0
-        _reward0, self._econ_impact, self._social_impact = self._compute_reward()
-        # Set previous means to current so first step has zero delta reward
-        self._prev_gas_loss_mean = self.gas_loss_mean
-        self._prev_elec_loss_mean = self.elec_loss_mean
-        self._prev_gas_soc_mean = self.gas_soc_mean
-        self._prev_elec_soc_mean = self.elec_soc_mean
+        self._base_heights = None
+        self._base_durations = None
+        metrics = self._compute_metrics(self.improvement_height, year=self._year)
+        (
+            self.gas_loss_mean,
+            self.elec_loss_mean,
+            self.gas_soc_mean,
+            self.elec_soc_mean,
+        ) = metrics
+        self._econ_impact = self.gas_loss_mean + self.elec_loss_mean
+        self._social_impact = self.gas_soc_mean + self.elec_soc_mean
         self._last_positive_mask = np.zeros(self.N, dtype=bool)
-        self._last_was_noop = False
+        self._prev_metrics = metrics
+        self._prev_loss = self._compute_loss(metrics)
         return self._obs(), {}
 
     def step(self, action):
@@ -425,6 +496,7 @@ class TrialEnv(gym.Env):
 
         intended_heights = self.height_levels[action_array]
         executed_heights = intended_heights.astype(np.float32).copy()
+        prev_improvement = self.improvement_height.astype(np.float32).copy()
 
         # Penalise repeated upgrades on consecutive steps
         repeat_mask = self._last_positive_mask & (executed_heights > 0.0)
@@ -438,7 +510,6 @@ class TrialEnv(gym.Env):
         total_cost = float(costs.sum())
 
         trimmed_assets: list[int] = []
-        over_budget_penalty_total = 0.0
         if total_cost > self.budget:
             # Drop the most expensive upgrades until affordable
             order = np.argsort(costs)[::-1]
@@ -453,27 +524,55 @@ class TrialEnv(gym.Env):
             if trimmed_assets:
                 costs = self._compute_costs(executed_heights)
                 total_cost = float(costs.sum())
-                over_budget_penalty_total = self.over_budget_penalty * len(trimmed_assets)
 
-        # Apply realised improvements
-        self.improvement_height = (self.improvement_height + executed_heights).astype(np.float32)
-        self.improvement_height = np.maximum(self.improvement_height, 0.0)
-        self.wall_height = self.improvement_height + self.initial_wall_height
+        post_improvement = np.maximum(prev_improvement + executed_heights, 0.0)
         self._last_positive_mask = executed_heights > 0.0
-        noop_penalty = 0.0
-        is_noop = bool(np.all(executed_heights <= 0.0))
-        if is_noop and self._last_was_noop:
-            noop_penalty = self.repeat_noop_penalty
-        self._last_was_noop = is_noop
-
-        # Advance time
         self._year += self.year_step
+        current_year = self._year
 
-        # Recompute impacts for current state
-        reward, self._econ_impact, self._social_impact = self._compute_reward()
+        rng_state = self.rng.bit_generator.state
+        base_metrics = self._compute_metrics(prev_improvement, year=current_year)
+        self.rng.bit_generator.state = rng_state
+        new_metrics = self._compute_metrics(post_improvement, year=current_year)
 
-        total_penalty = repeat_penalty_total + over_budget_penalty_total + noop_penalty
-        reward = float(reward + total_penalty)
+        (
+            base_gas_loss,
+            base_elec_loss,
+            base_gas_soc,
+            base_elec_soc,
+        ) = base_metrics
+        (
+            new_gas_loss,
+            new_elec_loss,
+            new_gas_soc,
+            new_elec_soc,
+        ) = new_metrics
+
+        prev_loss = self._prev_loss
+        base_loss = self._compute_loss(base_metrics)
+        new_loss = self._compute_loss(new_metrics)
+        climate_drift = base_loss - prev_loss
+        action_gain = base_loss - new_loss
+        reward_delta = prev_loss - new_loss
+
+        self.improvement_height = post_improvement.astype(np.float32)
+        self.wall_height = self.improvement_height + self.initial_wall_height
+        self.gas_loss_mean = new_gas_loss
+        self.elec_loss_mean = new_elec_loss
+        self.gas_soc_mean = new_gas_soc
+        self.elec_soc_mean = new_elec_soc
+        self._econ_impact = self.gas_loss_mean + self.elec_loss_mean
+        self._social_impact = self.gas_soc_mean + self.elec_soc_mean
+        self._prev_metrics = new_metrics
+        self._prev_loss = new_loss
+
+        reward_delta *= self.reward_scale
+        if self.budget > 0.0:
+            normalized_cost = total_cost / self.budget
+        else:
+            normalized_cost = total_cost
+        cost_penalty = self.cost_weight * normalized_cost
+        reward = float(reward_delta - cost_penalty + repeat_penalty_total)
 
         terminated = bool(self._year >= self.T)
         truncated = False
@@ -485,16 +584,19 @@ class TrialEnv(gym.Env):
             "costs": costs.astype(np.float32),
             "total_cost": float(total_cost),
             "unused_budget": float(max(self.budget - total_cost, 0.0)),
+            "normalized_cost": float(normalized_cost),
+            "cost_penalty": float(cost_penalty),
+            "prev_loss": float(prev_loss),
+            "base_loss": float(base_loss),
+            "new_loss": float(new_loss),
+            "climate_drift": float(climate_drift),
+            "action_gain": float(action_gain),
         }
         if repeat_count:
             info["repeat_penalty"] = float(repeat_penalty_total)
             info["repeat_penalty_assets"] = [int(i) for i in np.nonzero(repeat_mask)[0]]
         if trimmed_assets:
             info["trimmed_assets"] = trimmed_assets
-        if over_budget_penalty_total != 0.0:
-            info["over_budget_penalty"] = float(over_budget_penalty_total)
-        if noop_penalty != 0.0:
-            info["repeat_noop_penalty"] = float(noop_penalty)
         return self._obs(), reward, terminated, truncated, info
 
     def render(self):
