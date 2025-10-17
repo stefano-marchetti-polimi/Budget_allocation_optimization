@@ -52,7 +52,7 @@ class TrialEnv(gym.Env):
         maximum_repair_time: float = 40.75,
         repeat_asset_penalty: float = -1.0,
         reward_scale: float = 5000.0,
-        cost_weight: float = 2.0,
+        cost_weight: float = 5.0,
     ):
         super().__init__()
         assert num_nodes >= 1, "num_nodes must be >= 1"
@@ -373,7 +373,7 @@ class TrialEnv(gym.Env):
             low = float(lower[idx])
             high = float(upper[idx])
             if prev_value is not None:
-                low = max(low, prev_value)
+                low = max(low, prev_value+0.01)
             if high < low:
                 high = low
             sampled = float(
@@ -794,12 +794,15 @@ class TrialEnv(gym.Env):
         self._prev_loss = new_loss
 
         reward_delta *= self.reward_scale
+        unused_budget = float(max(self.budget - total_cost, 0.0))
         if self.budget > 0.0:
             normalized_cost = total_cost / self.budget
+            normalized_unused = unused_budget / self.budget
         else:
             normalized_cost = total_cost
-        cost_penalty = self.cost_weight * normalized_cost
-        reward = float(reward_delta - cost_penalty + repeat_penalty_total)
+            normalized_unused = 0.0
+        unused_budget_penalty = self.cost_weight * normalized_unused
+        reward = float(reward_delta - unused_budget_penalty + repeat_penalty_total)
 
         terminated = bool(self._year >= self.T)
         truncated = False
@@ -812,7 +815,8 @@ class TrialEnv(gym.Env):
             "total_cost": float(total_cost),
             "unused_budget": float(max(self.budget - total_cost, 0.0)),
             "normalized_cost": float(normalized_cost),
-            "cost_penalty": float(cost_penalty),
+            "normalized_unused_budget": float(normalized_unused),
+            "unused_budget_penalty": float(unused_budget_penalty),
             "prev_loss": float(prev_loss),
             "base_loss": float(base_loss),
             "new_loss": float(new_loss),
