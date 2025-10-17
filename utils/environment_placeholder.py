@@ -450,6 +450,7 @@ class TrialEnv(gym.Env):
         random_cache: Optional[dict[str, np.ndarray]] = None,
         *,
         return_cache: bool = False,
+        return_details: bool = False,
     ):
         if self._base_heights is None or self._base_durations is None:
             self._generate_hazard_samples()
@@ -617,14 +618,49 @@ class TrialEnv(gym.Env):
         elec_loss_mean = float(electricity_loss_samples.mean())
         gas_social_mean = float(gas_social_samples.mean())
         elec_social_mean = float(electricity_social_samples.mean())
+        depth_means = {
+            "PV": float(depth_PV.mean() + offset),
+            "Substation1": float(depth_sub1.mean() + offset),
+            "Substation2": float(depth_sub2.mean() + offset),
+            "Compressor1": float(depth_comp1.mean() + offset),
+            "Compressor2": float(depth_comp2.mean() + offset),
+            "Compressor3": float(depth_comp3.mean() + offset),
+            "ThermalUnit": float(depth_therm.mean() + offset),
+            "LNG": float(depth_LNG.mean() + offset),
+        }
+        depth_p95 = {
+            "PV": float(np.percentile(depth_PV, 95) + offset),
+            "Substation1": float(np.percentile(depth_sub1, 95) + offset),
+            "Substation2": float(np.percentile(depth_sub2, 95) + offset),
+            "Compressor1": float(np.percentile(depth_comp1, 95) + offset),
+            "Compressor2": float(np.percentile(depth_comp2, 95) + offset),
+            "Compressor3": float(np.percentile(depth_comp3, 95) + offset),
+            "ThermalUnit": float(np.percentile(depth_therm, 95) + offset),
+            "LNG": float(np.percentile(depth_LNG, 95) + offset),
+        }
+        depth_max = {
+            "PV": float(depth_PV.max() + offset),
+            "Substation1": float(depth_sub1.max() + offset),
+            "Substation2": float(depth_sub2.max() + offset),
+            "Compressor1": float(depth_comp1.max() + offset),
+            "Compressor2": float(depth_comp2.max() + offset),
+            "Compressor3": float(depth_comp3.max() + offset),
+            "ThermalUnit": float(depth_therm.max() + offset),
+            "LNG": float(depth_LNG.max() + offset),
+        }
+
         metrics = (
             gas_loss_mean,
             elec_loss_mean,
             gas_social_mean,
             elec_social_mean,
         )
+        if return_cache and return_details:
+            return metrics, cache, (depth_means, depth_p95, depth_max)
         if return_cache:
             return metrics, cache
+        if return_details:
+            return metrics, (depth_means, depth_p95, depth_max)
         return metrics
 
     def _compute_loss(self, metrics: tuple[float, float, float, float]) -> float:
@@ -755,16 +791,21 @@ class TrialEnv(gym.Env):
         self._set_weight_index(idx)
         prev_loss = self._compute_loss(self._prev_metrics)
 
-        base_metrics, random_cache = self._compute_metrics(
+        base_metrics, random_cache, depth_details_base = self._compute_metrics(
             prev_improvement,
             year=current_year,
             return_cache=True,
+            return_details=True,
         )
-        new_metrics = self._compute_metrics(
+        base_depth_means, base_depth_p95, base_depth_max = depth_details_base
+
+        new_metrics, depth_details_new = self._compute_metrics(
             post_improvement,
             year=current_year,
             random_cache=random_cache,
+            return_details=True,
         )
+        new_depth_means, new_depth_p95, new_depth_max = depth_details_new
 
         (
             base_gas_loss,
@@ -848,6 +889,12 @@ class TrialEnv(gym.Env):
             info["repeat_penalty_assets"] = [int(i) for i in np.nonzero(repeat_mask)[0]]
         if trimmed_assets:
             info["trimmed_assets"] = trimmed_assets
+        for asset_name, depth_val in new_depth_means.items():
+            info[f"expected_depth_mean_{asset_name}"] = float(depth_val)
+        for asset_name, depth_val in new_depth_p95.items():
+            info[f"expected_depth_p95_{asset_name}"] = float(depth_val)
+        for asset_name, depth_val in new_depth_max.items():
+            info[f"expected_depth_max_{asset_name}"] = float(depth_val)
         return self._obs(), reward, terminated, truncated, info
 
     def render(self):
