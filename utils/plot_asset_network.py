@@ -22,39 +22,32 @@ ASSET_DEPENDENCIES: Mapping[str, Sequence[str]] = {
     "Compressor1": ("LNG", "Substation1", "Substation2"),
     "Compressor2": ("LNG", "Substation1", "Substation2"),
     "Compressor3": ("LNG", "Substation1", "Substation2"),
-    "ThermalUnit": ("LNG", "Compressor3"),
+    "ThermalUnit": ("Compressor3",),
     "Substation1": ("ThermalUnit",),
 }
 
 # Optional edge labels to highlight the role of key connections.
 EDGE_LABELS: Dict[Tuple[str, str], str] = {
-    ("PV", "Substation2"): "Solar feed",
-    ("LNG", "Compressor1"): "Fuel supply",
-    ("LNG", "Compressor2"): "Fuel supply",
-    ("LNG", "Compressor3"): "Fuel supply",
-    ("LNG", "ThermalUnit"): "Fuel supply",
     ("Substation1", "Compressor1"): "Feeder S1-C1",
     ("Substation1", "Compressor2"): "Feeder S1-C2",
     ("Substation1", "Compressor3"): "Feeder S1-C3",
     ("Substation2", "Compressor1"): "Feeder S2-C1",
     ("Substation2", "Compressor2"): "Feeder S2-C2",
     ("Substation2", "Compressor3"): "Feeder S2-C3",
-    ("Compressor3", "ThermalUnit"): "Gas compression",
-    ("ThermalUnit", "Substation1"): "Power generation",
 }
 
 # Manually chosen coordinates to keep the diagram easy to read.
 MANUAL_POSITIONS: Mapping[str, Tuple[float, float]] = {
     # Anchor sources far apart so downstream edges do not stack.
-    "PV": (-10.0, 2.5),
-    "LNG": (10.0, 3.5),
+    "PV": (-11.0, 4.5),
+    "LNG": (11.0, 6.0),
     # Downstream assets arranged to follow the logical flow left-to-right.
-    "Substation2": (-6.0, 2.0),
-    "Compressor1": (-2.0, 5.0),
-    "Compressor2": (-2.0, 1.2),
-    "Compressor3": (-2.0, -2.6),
-    "ThermalUnit": (3.5, -3.5),
-    "Substation1": (7.0, -1.0),
+    "Substation2": (-6.0, 3.2),
+    "Compressor1": (-2.0, 7.5),
+    "Compressor2": (-2.0, 2.2),
+    "Compressor3": (-2.0, -3.0),
+    "ThermalUnit": (3.5, -5.5),
+    "Substation1": (7.0, -2.0),
 }
 
 
