@@ -19,13 +19,13 @@ from stable_baselines3 import PPO
 # -------------------- Evaluation configuration --------------------
 # Set USE_BEST_MODEL to True to load the best model saved during evaluation (results/best_models/best_model.zip by default).
 # If False, you can fall back to the latest checkpoint or a manually specified policy path.
-USE_BEST_MODEL = False
+USE_BEST_MODEL = True
 BEST_MODEL_FILENAME = "best_model.zip"
 
 # Set USE_LATEST_CHECKPOINT to True to automatically load the newest checkpoint inside
 # results/checkpoints. Set it to False and provide POLICY_PATH (with or without .zip)
 # to evaluate a specific file. Ignored when USE_BEST_MODEL is True.
-USE_LATEST_CHECKPOINT = True
+USE_LATEST_CHECKPOINT = False
 POLICY_PATH = None  # Only used when USE_LATEST_CHECKPOINT is False
 
 # Stable-Baselines device string (e.g., "cpu", "mps", "cuda").
@@ -36,7 +36,7 @@ EVAL_SEED = 1042
 
 # Deterministic evaluation runs a single greedy episode.
 # Set to False to sample actions; STOCHASTIC_EPISODES controls how many rollouts to average.
-DETERMINISTIC_EVAL = False
+DETERMINISTIC_EVAL = True
 STOCHASTIC_EPISODES = 10
 
 from optimization_parallel import (
@@ -290,6 +290,19 @@ def save_logs(
         "new_loss": [info.get("new_loss", np.nan) for info in infos_log],
     }
 
+    expected_depth_mean_cols = {
+        f"expected_depth_mean_{asset}": [info.get(f"expected_depth_mean_{asset}", np.nan) for info in infos_log]
+        for asset in ASSET_NAMES
+    }
+    expected_depth_p95_cols = {
+        f"expected_depth_p95_{asset}": [info.get(f"expected_depth_p95_{asset}", np.nan) for info in infos_log]
+        for asset in ASSET_NAMES
+    }
+    expected_depth_max_cols = {
+        f"expected_depth_max_{asset}": [info.get(f"expected_depth_max_{asset}", np.nan) for info in infos_log]
+        for asset in ASSET_NAMES
+    }
+
     penalty_cols = {
         "repeat_penalty": [info.get("repeat_penalty", 0.0) for info in infos_log],
         "unused_budget_penalty": [info.get("unused_budget_penalty", 0.0) for info in infos_log],
@@ -332,6 +345,9 @@ def save_logs(
             **weight_cols,
             **cost_cols,
             **impact_cols,
+            **expected_depth_mean_cols,
+            **expected_depth_p95_cols,
+            **expected_depth_max_cols,
             **penalty_cols,
             "reward": rewards_log,
             "obs_json": obs_str,
@@ -757,68 +773,117 @@ def save_logs(
     plt.close()
 
     if df["sea_level_offset"].notna().any():
-        plt.figure(figsize=(10, 4))
-        if multi_episode:
-            sea_stats = (
-                df.groupby("year")["sea_level_offset"]
-                .agg(["mean", "std"])
-                .rename(columns={"mean": "avg", "std": "std"})
-            )
-            height_stats = (
-                df.groupby("year")["total_cumulative_height"]
-                .agg(["mean", "std"])
-                .rename(columns={"mean": "avg", "std": "std"})
-            )
-            plt.errorbar(
-                sea_stats.index,
-                sea_stats["avg"],
-                yerr=sea_stats["std"].fillna(0.0),
-                marker="o",
-                linewidth=1.5,
-                capsize=3,
-                label="Sea level offset",
-            )
-            plt.errorbar(
-                height_stats.index,
-                height_stats["avg"],
-                yerr=height_stats["std"].fillna(0.0),
-                marker="s",
-                linewidth=1.5,
-                capsize=3,
-                label="Total wall height",
-            )
-        else:
-            episode0 = df[df["episode"] == df["episode"].iloc[0]]
-            plt.plot(
-                episode0["year"],
-                episode0["sea_level_offset"],
-                marker="o",
-                linewidth=1.5,
-                label="Sea level offset",
-            )
-            plt.plot(
-                episode0["year"],
-                episode0["total_cumulative_height"],
-                marker="s",
-                linewidth=1.5,
-                label="Total wall height",
-            )
-        plt.xlabel("Year")
-        plt.ylabel("Meters")
-        title = "Sea Level vs. Total Wall Height"
-        scenario_labels = df["climate_scenario"].dropna().unique().tolist()
-        if scenario_labels:
-            sample = ", ".join(sorted(label for label in scenario_labels if label))
-            if sample:
-                title += f" ({sample})"
-        plt.title(title)
-        plt.grid(True, axis="both", alpha=0.3)
-        plt.legend(loc="best")
-        plt.tight_layout()
-        plt.savefig(os.path.join(RESULTS_DIR, "sea_level_vs_height.png"))
-        plt.close()
+        # Per-asset sea level vs cumulative height plots
+        for cum_col in cumulative_height_columns:
+            asset_label = cum_col.replace("cumulative_height_", "")
+            depth_mean_col = f"expected_depth_mean_{asset_label}"
+            depth_p95_col = f"expected_depth_p95_{asset_label}"
+            depth_max_col = f"expected_depth_max_{asset_label}"
+            file_safe = asset_label.lower()
+            plt.figure(figsize=(10, 4))
+            if multi_episode:
+                depth_mean_stats = (
+                    df.groupby("year")[depth_mean_col]
+                    .agg(["mean", "std"])
+                    .rename(columns={"mean": "avg", "std": "std"})
+                )
+                depth_p95_stats = (
+                    df.groupby("year")[depth_p95_col]
+                    .agg(["mean", "std"])
+                    .rename(columns={"mean": "avg", "std": "std"})
+                )
+                depth_max_stats = (
+                    df.groupby("year")[depth_max_col]
+                    .agg(["mean", "std"])
+                    .rename(columns={"mean": "avg", "std": "std"})
+                )
+                height_stats = (
+                    df.groupby("year")[cum_col]
+                    .agg(["mean", "std"])
+                    .rename(columns={"mean": "avg", "std": "std"})
+                )
+                plt.errorbar(
+                    depth_mean_stats.index,
+                    depth_mean_stats["avg"],
+                    yerr=depth_mean_stats["std"].fillna(0.0),
+                    marker="o",
+                    linewidth=1.5,
+                    capsize=3,
+                    label="Mean depth",
+                )
+                plt.errorbar(
+                    depth_p95_stats.index,
+                    depth_p95_stats["avg"],
+                    yerr=depth_p95_stats["std"].fillna(0.0),
+                    marker="^",
+                    linewidth=1.5,
+                    capsize=3,
+                    label="95th percentile depth",
+                )
+                plt.errorbar(
+                    depth_max_stats.index,
+                    depth_max_stats["avg"],
+                    yerr=depth_max_stats["std"].fillna(0.0),
+                    marker="v",
+                    linewidth=1.5,
+                    capsize=3,
+                    label="Max depth",
+                )
+                plt.errorbar(
+                    height_stats.index,
+                    height_stats["avg"],
+                    yerr=height_stats["std"].fillna(0.0),
+                    marker="s",
+                    linewidth=1.5,
+                    capsize=3,
+                    label=f"{asset_label} height",
+                )
+            else:
+                episode_data = df[df["episode"] == df["episode"].iloc[0]]
+                plt.plot(
+                    episode_data["year"],
+                    episode_data[depth_mean_col],
+                    marker="o",
+                    linewidth=1.5,
+                    label="Mean depth",
+                )
+                plt.plot(
+                    episode_data["year"],
+                    episode_data[depth_p95_col],
+                    marker="^",
+                    linewidth=1.5,
+                    label="95th percentile depth",
+                )
+                plt.plot(
+                    episode_data["year"],
+                    episode_data[depth_max_col],
+                    marker="v",
+                    linewidth=1.5,
+                    label="Max depth",
+                )
+                plt.plot(
+                    episode_data["year"],
+                    episode_data[cum_col],
+                    marker="s",
+                    linewidth=1.5,
+                    label=f"{asset_label} height",
+                )
+            plt.xlabel("Year")
+            plt.ylabel("Meters")
+            title = f"Flood Depth vs. {asset_label} Height"
+            scenario_labels = df["climate_scenario"].dropna().unique().tolist()
+            if scenario_labels:
+                sample = ", ".join(sorted(label for label in scenario_labels if label))
+                if sample:
+                    title += f" ({sample})"
+            plt.title(title)
+            plt.grid(True, axis="both", alpha=0.3)
+            plt.legend(loc="best")
+            plt.tight_layout()
+            plt.savefig(os.path.join(RESULTS_DIR, f"expected_depth_vs_height_{file_safe}.png"))
+            plt.close()
 
-        # Per-asset cumulative height plot
+        # Per-asset cumulative height plot (unchanged)
         fig, ax = plt.subplots(figsize=(12, 4))
         for cum_col in cumulative_height_columns:
             asset_label = cum_col.replace("cumulative_height_", "")
