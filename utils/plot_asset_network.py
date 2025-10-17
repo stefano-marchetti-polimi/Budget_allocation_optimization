@@ -17,7 +17,7 @@ __all__ = ["plot_asset_dependency_network"]
 
 # Directed dependencies: each asset lists the upstream components it requires
 # to be operational. Edges are drawn from dependency -> dependent.
-ASSET_DEPENDENCIES: Mapping[str, Sequence[str]] = {
+BASE_ASSET_DEPENDENCIES: Mapping[str, Sequence[str]] = {
     "Substation2": ("PV",),
     "Compressor1": ("LNG", "Substation1", "Substation2"),
     "Compressor2": ("LNG", "Substation1", "Substation2"),
@@ -26,8 +26,16 @@ ASSET_DEPENDENCIES: Mapping[str, Sequence[str]] = {
     "Substation1": ("ThermalUnit",),
 }
 
+EXTENDED_ASSET_DEPENDENCIES: Mapping[str, Sequence[str]] = {
+    "Substation3": ("ThermalUnit",),
+    "Compressor4": ("LNG_Backup", "Substation1", "Substation3"),
+    "ThermalUnit2": ("Compressor4",),
+    "Substation4": ("PV_Expansion", "ThermalUnit2"),
+    "Compressor5": ("LNG_Backup", "Substation3", "Substation4"),
+}
+
 # Optional edge labels to highlight the role of key connections.
-EDGE_LABELS: Dict[Tuple[str, str], str] = {
+BASE_EDGE_LABELS: Dict[Tuple[str, str], str] = {
     ("Substation1", "Compressor1"): "Feeder S1-C1",
     ("Substation1", "Compressor2"): "Feeder S1-C2",
     ("Substation1", "Compressor3"): "Feeder S1-C3",
@@ -36,8 +44,15 @@ EDGE_LABELS: Dict[Tuple[str, str], str] = {
     ("Substation2", "Compressor3"): "Feeder S2-C3",
 }
 
+EXTENDED_EDGE_LABELS: Dict[Tuple[str, str], str] = {
+    ("Substation1", "Compressor4"): "Feeder S1-C4",
+    ("Substation3", "Compressor4"): "Feeder S3-C4",
+    ("Substation3", "Compressor5"): "Feeder S3-C5",
+    ("Substation4", "Compressor5"): "Feeder S4-C5",
+}
+
 # Manually chosen coordinates to keep the diagram easy to read.
-MANUAL_POSITIONS: Mapping[str, Tuple[float, float]] = {
+BASE_MANUAL_POSITIONS: Mapping[str, Tuple[float, float]] = {
     # Anchor sources far apart so downstream edges do not stack.
     "PV": (-11.0, 4.5),
     "LNG": (11.0, 6.0),
@@ -50,11 +65,42 @@ MANUAL_POSITIONS: Mapping[str, Tuple[float, float]] = {
     "Substation1": (7.0, -2.0),
 }
 
+EXTENDED_MANUAL_POSITIONS: Mapping[str, Tuple[float, float]] = {
+    "PV_Expansion": (-11.0, 8.5),
+    "LNG_Backup": (13.0, 8.0),
+    "Substation3": (3.5, 0.5),
+    "Compressor4": (1.0, 4.5),
+    "ThermalUnit2": (6.0, -6.5),
+    "Substation4": (9.0, 2.0),
+    "Compressor5": (5.0, 5.5),
+}
 
-def _collect_assets() -> Sequence[str]:
+
+def _dependency_map(include_extensions: bool) -> Dict[str, Sequence[str]]:
+    data: Dict[str, Sequence[str]] = dict(BASE_ASSET_DEPENDENCIES)
+    if include_extensions:
+        data.update(EXTENDED_ASSET_DEPENDENCIES)
+    return data
+
+
+def _edge_labels(include_extensions: bool) -> Dict[Tuple[str, str], str]:
+    labels: Dict[Tuple[str, str], str] = dict(BASE_EDGE_LABELS)
+    if include_extensions:
+        labels.update(EXTENDED_EDGE_LABELS)
+    return labels
+
+
+def _manual_positions(include_extensions: bool) -> Dict[str, Tuple[float, float]]:
+    positions: Dict[str, Tuple[float, float]] = dict(BASE_MANUAL_POSITIONS)
+    if include_extensions:
+        positions.update(EXTENDED_MANUAL_POSITIONS)
+    return positions
+
+
+def _collect_assets(dependency_map: Mapping[str, Sequence[str]]) -> Sequence[str]:
     """Gather the unique set of assets present in the dependency map."""
-    downstream = set(ASSET_DEPENDENCIES.keys())
-    upstream = {asset for deps in ASSET_DEPENDENCIES.values() for asset in deps}
+    downstream = set(dependency_map.keys())
+    upstream = {asset for deps in dependency_map.values() for asset in deps}
     ordered = list(dict.fromkeys(list(upstream) + list(downstream)))
     return sorted(ordered)
 
@@ -69,36 +115,17 @@ def _circular_layout(nodes: Sequence[str], radius: float = 2.5) -> Dict[str, Tup
     return positions
 
 
-def _compute_positions(nodes: Sequence[str], use_networkx: bool) -> Dict[str, Tuple[float, float]]:
-    """Get plotting coordinates, optionally using networkx spring layout."""
-    manual = {node: MANUAL_POSITIONS[node] for node in nodes if node in MANUAL_POSITIONS}
-    missing = [node for node in nodes if node not in manual]
-
-    if use_networkx:
-        try:
-            import networkx as nx  # type: ignore
-        except ImportError:
-            pass
-        else:
-            graph = nx.DiGraph()
-            graph.add_nodes_from(nodes)
-            graph.add_edges_from(
-                (dependency, asset)
-                for asset, dependencies in ASSET_DEPENDENCIES.items()
-                for dependency in dependencies
-            )
-            manual = nx.spring_layout(
-                graph,
-                seed=42,
-                k=2.0,
-                scale=8.0,
-                iterations=300,
-            )  # type: ignore[assignment]
-            return dict(manual)
-
+def _compute_positions(
+    nodes: Sequence[str],
+    include_extensions: bool,
+) -> Dict[str, Tuple[float, float]]:
+    """Get plotting coordinates based on predefined manual positions."""
+    manual_positions = _manual_positions(include_extensions)
+    positions = {node: manual_positions[node] for node in nodes if node in manual_positions}
+    missing = [node for node in nodes if node not in positions]
     if missing:
-        manual.update(_circular_layout(missing))
-    return manual
+        positions.update(_circular_layout(missing))
+    return positions
 
 
 def plot_asset_dependency_network(
@@ -106,16 +133,22 @@ def plot_asset_dependency_network(
     ax: plt.Axes | None = None,
     show: bool = True,
     save_path: str | None = None,
-    use_networkx: bool = False,
+    include_extensions: bool = False,
+    subplot_title: str | None = None,
 ) -> Tuple[plt.Figure, plt.Axes]:
     """Plot the asset dependency graph described by TrialEnv."""
-    nodes = _collect_assets()
-    positions = _compute_positions(nodes, use_networkx=use_networkx)
+    dependency_map = _dependency_map(include_extensions)
+    nodes = _collect_assets(dependency_map)
+    positions = _compute_positions(
+        nodes,
+        include_extensions=include_extensions,
+    )
     edges = [
         (dependency, asset)
-        for asset, dependencies in ASSET_DEPENDENCIES.items()
+        for asset, dependencies in dependency_map.items()
         for dependency in dependencies
     ]
+    edge_labels = _edge_labels(include_extensions)
 
     fig: plt.Figure
     if ax is None:
@@ -126,6 +159,8 @@ def plot_asset_dependency_network(
     ax.set_aspect("equal")
     ax.axis("off")
     ax.margins(0.2)
+    if subplot_title:
+        ax.set_title(subplot_title, fontsize=13)
 
     # Draw edges first so node markers appear on top.
     for start, end in edges:
@@ -145,7 +180,7 @@ def plot_asset_dependency_network(
             ),
         )
 
-        label = EDGE_LABELS.get((start, end))
+        label = edge_labels.get((start, end))
         if label:
             mid_x = (x0 + x1) / 2.0
             mid_y = (y0 + y1) / 2.0
@@ -176,7 +211,7 @@ def plot_asset_dependency_network(
             [x],
             [y],
             s=440,
-            color="#2b83ba" if node not in ASSET_DEPENDENCIES else "#abdda4",
+            color="#2b83ba" if node not in dependency_map else "#abdda4",
             edgecolors="#1f1f1f",
             linewidths=1.2,
             zorder=3,
@@ -201,4 +236,4 @@ def plot_asset_dependency_network(
 
 
 if __name__ == "__main__":
-    plot_asset_dependency_network()
+    plot_asset_dependency_network(include_extensions=False)
