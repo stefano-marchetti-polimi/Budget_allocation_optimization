@@ -6,6 +6,7 @@ import math
 import json
 import csv
 import shutil
+from typing import Sequence
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -402,6 +403,63 @@ class EntropyScheduleCallback(BaseCallback):
         self._apply_schedule()
         return True
 
+
+class InfoMetricsCallback(BaseCallback):
+    """Aggregate environment info metrics and log them to TensorBoard."""
+
+    def __init__(
+        self,
+        keys: Sequence[str],
+        prefix: str = "train/info",
+        log_std: bool = True,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self.keys = list(keys)
+        self.prefix = prefix.rstrip("/")
+        self.log_std = bool(log_std)
+        self._buffer: dict[str, list[float]] = {key: [] for key in self.keys}
+
+    def _init_buffer(self) -> None:
+        self._buffer = {key: [] for key in self.keys}
+
+    def _safe_append(self, key: str, value) -> None:
+        try:
+            scalar = float(value)
+        except (TypeError, ValueError):
+            return
+        if not np.isfinite(scalar):
+            return
+        self._buffer[key].append(scalar)
+
+    def _on_training_start(self) -> None:
+        self._init_buffer()
+
+    def _on_rollout_end(self) -> bool:
+        for key, values in self._buffer.items():
+            if not values:
+                continue
+            arr = np.asarray(values, dtype=np.float32)
+            self.logger.record(f"{self.prefix}/{key}_mean", float(arr.mean()))
+            if self.log_std:
+                self.logger.record(f"{self.prefix}/{key}_std", float(arr.std()))
+        self._init_buffer()
+        return True
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", None)
+        if infos is None:
+            return True
+        for info in infos:
+            if not info:
+                continue
+            for key in self.keys:
+                value = info.get(key)
+                if value is None:
+                    continue
+                self._safe_append(key, value)
+        return True
+
 def make_env(seed: int, rank: int):
     """Factory for vectorized envs (must be at module top level for pickling)."""
     def _thunk():
@@ -502,6 +560,20 @@ def main():
 
     action_callback = ActionDistributionCallback(log_dir=LOG_DIR, log_every=1, verbose=0)
     entropy_callback = EntropyScheduleCallback(schedule_fn=ent_schedule, verbose=0)
+    info_keys = (
+        "reward_delta",
+        "unused_budget_penalty",
+        "unused_budget_penalty_signed",
+        "over_budget_penalty",
+        "over_budget_penalty_signed",
+        "repeat_penalty",
+        "normalized_unused_budget",
+        "action_gain",
+        "total_cost",
+        "unused_budget",
+        "over_budget_amount",
+    )
+    info_callback = InfoMetricsCallback(keys=info_keys, prefix="train/info", verbose=0)
 
     eval_env_vec = make_eval_env(seed + 1000)
     eval_callback = EvalCallback(
@@ -522,7 +594,7 @@ def main():
         save_vecnormalize=False,
         verbose=0,
     )
-    callback = CallbackList([entropy_callback, action_callback, eval_callback, checkpoint_callback])
+    callback = CallbackList([entropy_callback, action_callback, info_callback, eval_callback, checkpoint_callback])
 
     model.learn(total_timesteps=RL_steps, callback=callback)
     model.save(os.path.join(RESULTS_DIR, "policy"))

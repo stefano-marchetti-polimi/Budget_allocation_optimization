@@ -50,9 +50,9 @@ class TrialEnv(gym.Env):
         climate_scenario: str = "All",
         normalize_observations: bool = True,
         maximum_repair_time: float = 40.75,
-        repeat_asset_penalty: float = -1.0,
-        reward_scale: float = 5000.0,
-        cost_weight: float = 5.0,
+        repeat_asset_penalty: float = -0.25,
+        reward_scale: float = 12000.0,
+        cost_weight: float = 0.4,
     ):
         super().__init__()
         assert num_nodes >= 1, "num_nodes must be >= 1"
@@ -722,7 +722,8 @@ class TrialEnv(gym.Env):
 
         costs = self._compute_costs(executed_heights)
         total_cost = float(costs.sum())
-
+        over_budget_penalty_total = 0.0
+        over_budget_amount = 0.0
         trimmed_assets: list[int] = []
         if total_cost > self.budget:
             # Drop the most expensive upgrades until affordable
@@ -730,6 +731,7 @@ class TrialEnv(gym.Env):
             for idx in order:
                 if executed_heights[idx] <= 0.0:
                     continue
+                over_budget_amount += float(costs[idx])
                 trimmed_assets.append(int(idx))
                 total_cost -= float(costs[idx])
                 executed_heights[idx] = 0.0
@@ -738,6 +740,7 @@ class TrialEnv(gym.Env):
             if trimmed_assets:
                 costs = self._compute_costs(executed_heights)
                 total_cost = float(costs.sum())
+                over_budget_penalty_total = self.cost_weight * (over_budget_amount / self.budget if self.budget > 0.0 else over_budget_amount)
 
         post_improvement = np.maximum(prev_improvement + executed_heights, 0.0)
         self._last_positive_mask = executed_heights > 0.0
@@ -802,7 +805,12 @@ class TrialEnv(gym.Env):
             normalized_cost = total_cost
             normalized_unused = 0.0
         unused_budget_penalty = self.cost_weight * normalized_unused
-        reward = float(reward_delta - unused_budget_penalty + repeat_penalty_total)
+        reward = float(
+            reward_delta
+            - unused_budget_penalty
+            + repeat_penalty_total
+            - over_budget_penalty_total
+        )
 
         terminated = bool(self._year >= self.T)
         truncated = False
@@ -817,12 +825,18 @@ class TrialEnv(gym.Env):
             "normalized_cost": float(normalized_cost),
             "normalized_unused_budget": float(normalized_unused),
             "unused_budget_penalty": float(unused_budget_penalty),
+            "unused_budget_penalty_signed": float(-unused_budget_penalty),
+            "over_budget_penalty": float(over_budget_penalty_total),
+            "over_budget_penalty_signed": float(-over_budget_penalty_total),
+            "over_budget_amount": float(over_budget_amount),
+            "reward_delta": float(reward_delta),
             "prev_loss": float(prev_loss),
             "base_loss": float(base_loss),
             "new_loss": float(new_loss),
             "climate_drift": float(climate_drift),
             "action_gain": float(action_gain),
         }
+        info["repeat_penalty"] = float(repeat_penalty_total)
         if self._active_climate_scenario is not None:
             info["climate_scenario"] = self._active_climate_scenario
             info["sea_level_offset"] = float(self._sea_level_offset_for_year(current_year))
@@ -831,7 +845,6 @@ class TrialEnv(gym.Env):
                 if 0 <= delta_idx < self._sea_level_deltas.shape[0]:
                     info["sea_level_delta"] = float(self._sea_level_deltas[delta_idx])
         if repeat_count:
-            info["repeat_penalty"] = float(repeat_penalty_total)
             info["repeat_penalty_assets"] = [int(i) for i in np.nonzero(repeat_mask)[0]]
         if trimmed_assets:
             info["trimmed_assets"] = trimmed_assets
