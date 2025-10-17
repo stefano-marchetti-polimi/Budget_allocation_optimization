@@ -144,6 +144,11 @@ def rollout_episode(
             "trimmed_steps": 0.0,
             "trimmed_assets": 0.0,
         },
+        "over_budget_penalty": {
+            "steps": 0.0,
+            "total": 0.0,
+            "amount": 0.0,
+        },
     }
 
     terminated = False
@@ -185,6 +190,14 @@ def rollout_episode(
         penalty_summary["budget_penalty"]["normalized_total"] += float(
             info.get("normalized_unused_budget", 0.0)
         )
+        over_budget_pen = float(info.get("over_budget_penalty_signed", 0.0))
+        if over_budget_pen:
+            penalty_summary["over_budget_penalty"]["steps"] += 1
+            penalty_summary["over_budget_penalty"]["total"] += float(info.get("over_budget_penalty", 0.0))
+            penalty_summary["over_budget_penalty"]["amount"] += float(info.get("over_budget_amount", 0.0))
+            penalty_msgs.append(
+                f"over_budget_penalty={over_budget_pen:.3f} amount={info.get('over_budget_amount', 0.0):.3f}"
+            )
 
         budget_parts: List[str] = []
         if "total_cost" in info:
@@ -193,6 +206,8 @@ def rollout_episode(
             budget_parts.append(f"unused={info['unused_budget']:.3f}")
         if "normalized_cost" in info:
             budget_parts.append(f"normalized={info['normalized_cost']:.3f}")
+        if over_budget_pen:
+            budget_parts.append(f"over={info.get('over_budget_amount', 0.0):.3f}")
         trimmed = info.get("trimmed_assets", [])
         if trimmed:
             penalty_summary["budget_penalty"]["trimmed_steps"] += 1
@@ -278,6 +293,8 @@ def save_logs(
     penalty_cols = {
         "repeat_penalty": [info.get("repeat_penalty", 0.0) for info in infos_log],
         "unused_budget_penalty": [info.get("unused_budget_penalty", 0.0) for info in infos_log],
+        "over_budget_penalty": [info.get("over_budget_penalty", 0.0) for info in infos_log],
+        "over_budget_amount": [info.get("over_budget_amount", 0.0) for info in infos_log],
         "normalized_cost": [info.get("normalized_cost", 0.0) for info in infos_log],
         "normalized_unused_budget": [info.get("normalized_unused_budget", 0.0) for info in infos_log],
         "repeat_penalty_assets": [
@@ -323,9 +340,6 @@ def save_logs(
             "step_in_episode": step_indices,
         }
     )
-    df.to_csv(os.path.join(RESULTS_DIR, "evaluation_logs.csv"), index=False)
-
-    df = df.sort_values(["episode", "step_in_episode"]).reset_index(drop=True)
 
     multi_episode = df["episode"].nunique() > 1
     years_axis = df["year"].to_numpy()
@@ -352,9 +366,15 @@ def save_logs(
     df["reward_delta_component"] = (
         df["reward"]
         + df["unused_budget_penalty"].astype(float)
+        + df["over_budget_penalty"].astype(float)
         - df["repeat_penalty"].astype(float)
     )
     df["unused_budget_penalty_signed"] = -df["unused_budget_penalty"].astype(float)
+    df["over_budget_penalty_signed"] = -df["over_budget_penalty"].astype(float)
+
+    df.to_csv(os.path.join(RESULTS_DIR, "evaluation_logs.csv"), index=False)
+
+    df = df.sort_values(["episode", "step_in_episode"]).reset_index(drop=True)
 
     fig, axes = plt.subplots(
         actions_arr.shape[1],
@@ -625,7 +645,7 @@ def save_logs(
     plt.figure(figsize=(10, 4))
     if multi_episode:
         reward_stats = (
-            df.groupby("year")[["reward_delta_component", "unused_budget_penalty_signed", "repeat_penalty"]]
+            df.groupby("year")[["reward_delta_component", "unused_budget_penalty_signed", "over_budget_penalty_signed", "repeat_penalty"]]
             .agg(["mean", "std"])
             .rename(columns={"mean": "avg", "std": "std"})
         )
@@ -650,6 +670,15 @@ def save_logs(
         )
         plt.errorbar(
             years,
+            reward_stats[("over_budget_penalty_signed", "avg")],
+            yerr=reward_stats[("over_budget_penalty_signed", "std")].fillna(0.0),
+            marker="d",
+            linewidth=1.5,
+            capsize=3,
+            label="Over-budget penalty",
+        )
+        plt.errorbar(
+            years,
             reward_stats[("repeat_penalty", "avg")],
             yerr=reward_stats[("repeat_penalty", "std")].fillna(0.0),
             marker="^",
@@ -669,6 +698,13 @@ def save_logs(
             df["year"],
             df["unused_budget_penalty_signed"],
             label="Unused-budget penalty",
+            width=2.0,
+            alpha=0.7,
+        )
+        plt.bar(
+            df["year"],
+            df["over_budget_penalty_signed"],
+            label="Over-budget penalty",
             width=2.0,
             alpha=0.7,
         )
@@ -965,6 +1001,11 @@ def main() -> None:
             "trimmed_steps": 0.0,
             "trimmed_assets": 0.0,
         },
+        "over_budget_penalty": {
+            "steps": 0.0,
+            "total": 0.0,
+            "amount": 0.0,
+        },
     }
 
     all_actions: List[np.ndarray] = []
@@ -1049,6 +1090,14 @@ def main() -> None:
                 f"Trimmed adjustments: {int(budget_stats['trimmed_steps'])} step(s), "
                 f"assets trimmed {int(budget_stats['trimmed_assets'])}"
             )
+    over_budget_stats = aggregated_penalties["over_budget_penalty"]
+    if over_budget_stats["steps"]:
+        avg_over_penalty = over_budget_stats["total"] / over_budget_stats["steps"]
+        avg_over_amount = over_budget_stats["amount"] / over_budget_stats["steps"]
+        print(
+            f"Average over-budget amount per offending step: {avg_over_amount:.3f} "
+            f"(penalty contribution: {avg_over_penalty:.3f})"
+        )
 
 
 if __name__ == "__main__":
