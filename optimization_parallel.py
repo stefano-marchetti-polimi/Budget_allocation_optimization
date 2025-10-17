@@ -13,8 +13,8 @@ import pandas as pd
 import gymnasium as gym
 
 # -------------------- User parameters --------------------
-SCENARIO_NAME = "neutral"  # decision-maker preferences (see DM_Scenarios.csv for available labels)
-CLIMATE_SCENARIO = "SSP5-8.5"  # sea level rise projections (keys from Projections.csv or "All" to sample each episode)
+SCENARIO_NAME = "neutral"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social)
+CLIMATE_SCENARIO = "SSP5-8.5"  # sea level rise projections (SSP1-1.9, SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5, All)
 BUDGET = 500000
 MC_SAMPLES = 50000
 
@@ -22,6 +22,7 @@ num_nodes = 8
 years = 75 # until 2100
 year_step = 5 # 15 decisions
 RL_steps = 5000000
+learning_rate = 5e-4
 
 # Per-asset footprint areas (m^2)
 area = np.array([100, 150, 150, 50, 50, 50, 200, 300], dtype=np.float32)
@@ -485,7 +486,7 @@ def main():
         n_steps=n_steps,
         batch_size=batch_size,
         n_epochs=n_epochs,
-        learning_rate=2e-4,
+        learning_rate=learning_rate,
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
