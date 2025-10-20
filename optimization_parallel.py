@@ -50,7 +50,7 @@ from stable_baselines3.common.callbacks import (
     CallbackList,
     CheckpointCallback,
 )
-from utils.environment_placeholder import TrialEnv  # must be importable at top level
+from utils.environment import TrialEnv  # must be importable at top level
 
 WEIGHT_VECTOR_KEYS = ("W_g", "W_e", "W_ge", "W_gs", "W_ee", "W_es")
 

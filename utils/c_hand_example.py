@@ -97,7 +97,7 @@ plt.show()
 """### run c-HAND"""
 
 ocean_pixel = (ocean_E, ocean_N)
-ike_gage = 5  # meters NAVD88
+ike_gage = 0  # meters NAVD88
 pgf.c_hand(ocean_coords=ocean_pixel, gage_el=ike_gage)
 
 """### Crop out coastline and plot coastal inundation map"""
@@ -171,6 +171,25 @@ plt.show()
 
 # save figure
 fig.savefig(Path("data", "inun_ike.png"), dpi=200, bbox_inches="tight")
+
+# === Additional plot: baseline background with zero inundation ===
+fig_bg, ax_bg = plot_raster(
+    raster=inun_ike,
+    profile=ike_profile,
+    label="Inundation Depth [m]",
+    interpolation="nearest",
+    cmap="Blues",
+    vmax=ike_gage,
+    vmin=0,
+)
+ax_bg.set(
+    title="Baseline Map (0 m Inundation)",
+    xlabel="UTM 15N Easting [m]",
+    ylabel="UTM 15N Northing [m]",
+)
+plt.show()
+
+fig_bg.savefig(Path("data", "inun_zero_depth.png"), dpi=200, bbox_inches="tight")
 
 # === Additional plot: color-coded assets with numbering ===
 fig2, ax2 = plot_raster(
