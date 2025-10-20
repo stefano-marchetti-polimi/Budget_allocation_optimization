@@ -60,14 +60,7 @@ ASSET_TYPE_COLORS: Mapping[str, str] = {
 }
 
 # Optional edge labels to highlight the role of key connections.
-BASE_EDGE_LABELS: Dict[Tuple[str, str], str] = {
-    ("Substation1", "Compressor1"): "Feeder S1-C1",
-    ("Substation1", "Compressor2"): "Feeder S1-C2",
-    ("Substation1", "Compressor3"): "Feeder S1-C3",
-    ("Substation2", "Compressor1"): "Feeder S2-C1",
-    ("Substation2", "Compressor2"): "Feeder S2-C2",
-    ("Substation2", "Compressor3"): "Feeder S2-C3",
-}
+BASE_EDGE_LABELS: Dict[Tuple[str, str], str] = {}
 
 # Manually chosen coordinates to keep the diagram easy to read.
 BASE_MANUAL_POSITIONS: Mapping[str, Tuple[float, float]] = {
@@ -98,6 +91,9 @@ BASE_ASSET_COORDINATES: Mapping[str, Tuple[float, float]] = {
 ASSET_COORD_CRS = "EPSG:32615"
 DEFAULT_DEM_PATH = Path("data/houston_example_DEM_30m.tif")
 DEFAULT_BACKGROUND_IMAGE = Path("data/inun_zero_depth.png")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_IMAGE_DIR = REPO_ROOT / "Images"
+DEFAULT_PRIMARY_FILENAME = "asset_dependency_map.png"
 
 
 def _dependency_map() -> Dict[str, Sequence[str]]:
@@ -350,15 +346,18 @@ def _draw_geographic_network(
         ax.scatter(
             [coord[0]],
             [coord[1]],
-            s=120,
+            s=160,
             color=color,
-            edgecolors="#1f1f1f",
-            linewidths=0.9,
+            edgecolors="#0f0f0f",
+            linewidths=1.1,
             zorder=4,
         )
+        label_x, label_y = coord
+        if node == "Compressor1":
+            label_y += 2500.0
         text = ax.text(
-            coord[0],
-            coord[1],
+            label_x,
+            label_y,
             node,
             fontsize=9,
             ha="left",
@@ -582,7 +581,7 @@ def plot_asset_dependency_network(
                     label_facecolor="#1f1f1f",
                     label_alpha=0.75,
                     label_text_color="white",
-                    node_label_color="white",
+                    node_label_color="black",
                 )
                 if legend_img:
                     ax_img.legend(
@@ -698,15 +697,20 @@ def plot_asset_dependency_network(
         fig._secondary_map_figure = secondary_fig
         if secondary_fig is not None:
             secondary_fig._primary_map_figure = fig
-    save_path_obj = Path(save_path) if save_path is not None else None
-    if save_path_obj is not None:
-        fig.savefig(save_path_obj, bbox_inches="tight")
-        if include_map and secondary_fig is not None:
-            if save_path_obj.suffix:
-                secondary_path = save_path_obj.with_name(f"{save_path_obj.stem}_image{save_path_obj.suffix}")
-            else:
-                secondary_path = Path(str(save_path_obj) + "_image")
-            secondary_fig.savefig(secondary_path, bbox_inches="tight")
+    if save_path is not None:
+        save_path_obj = Path(save_path)
+    else:
+        save_path_obj = DEFAULT_IMAGE_DIR / DEFAULT_PRIMARY_FILENAME
+
+    save_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path_obj, bbox_inches="tight")
+    secondary_path: Path | None = None
+    if include_map and secondary_fig is not None:
+        if save_path_obj.suffix:
+            secondary_path = save_path_obj.with_name(f"{save_path_obj.stem}_image{save_path_obj.suffix}")
+        else:
+            secondary_path = Path(str(save_path_obj) + "_image")
+        secondary_fig.savefig(secondary_path, bbox_inches="tight")
     if show:
         plt.show()
     return fig, ax
