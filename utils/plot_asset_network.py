@@ -52,8 +52,8 @@ ASSET_TYPE_MAP: Mapping[str, str] = {
 
 ASSET_TYPE_COLORS: Mapping[str, str] = {
     "Renewable Generation": "#5ab4ac",
-    "Thermal Generation": "#d8b365",
-    "Fuel Supply": "#fdb863",
+    "Thermal Generation": "#b8860b",
+    "Fuel Supply": "#6c93ff",
     "Electrical Distribution": "#c7e9c0",
     "Gas Compression": "#80b1d3",
     "Unclassified": "#bdbdbd",
@@ -282,6 +282,8 @@ def _draw_geographic_network(
     label_alpha: float = 0.7,
     label_text_color: str = "black",
     node_label_color: str = "black",
+    colored_arrows: bool = False,
+    arrow_outline_color: str = "#101010",
 ) -> Dict[str, Line2D]:
     """Draw dependency edges and nodes using real-world coordinates."""
     missing_assets: set[str] = set()
@@ -296,19 +298,21 @@ def _draw_geographic_network(
             if end_coord is None:
                 missing_assets.add(end)
             continue
+        start_asset_type = _categorize_asset(start)
+        start_color = ASSET_TYPE_COLORS.get(start_asset_type, ASSET_TYPE_COLORS["Unclassified"])
+        arrow_kwargs = dict(
+            linewidth=edge_linewidth,
+            shrinkA=6,
+            shrinkB=20,
+            mutation_scale=4,
+            alpha=edge_alpha,
+        )
+        arrow_kwargs["color"] = start_color if colored_arrows else edge_color
         ax.annotate(
             "",
             xy=end_coord,
             xytext=start_coord,
-            arrowprops=dict(
-                arrowstyle="->",
-                color=edge_color,
-                linewidth=edge_linewidth,
-                alpha=edge_alpha,
-                shrinkA=8,
-                shrinkB=8,
-                mutation_scale=10,
-            ),
+            arrowprops=arrow_kwargs,
             zorder=2,
         )
         label = edge_labels.get((start, end))
@@ -411,12 +415,11 @@ def _draw_network_overlay(
             xy=end_coord,
             xytext=start_coord,
             arrowprops=dict(
-                arrowstyle="->",
                 color="#4a4a4a",
                 linewidth=1.4,
-                shrinkA=8,
-                shrinkB=8,
-                mutation_scale=10,
+                shrinkA=6,
+                shrinkB=20,
+                mutation_scale=4,
             ),
             zorder=2,
         )
@@ -503,6 +506,7 @@ def plot_asset_dependency_network(
     include_map: bool = True,
     dem_path: str | Path | None = DEFAULT_DEM_PATH,
     background_image: str | Path | None = DEFAULT_BACKGROUND_IMAGE,
+    colored_arrows: bool = True,
 ) -> Tuple[plt.Figure, plt.Axes]:
     """Plot asset dependencies and optionally overlay geographic locations on a map."""
     dependency_map = _dependency_map()
@@ -548,6 +552,8 @@ def plot_asset_dependency_network(
             edges,
             edge_labels,
             coord_map,
+            colored_arrows=colored_arrows,
+            arrow_outline_color="#101010",
         )
 
         if legend_handles:
@@ -582,6 +588,8 @@ def plot_asset_dependency_network(
                     label_alpha=0.75,
                     label_text_color="white",
                     node_label_color="black",
+                    colored_arrows=colored_arrows,
+                    arrow_outline_color="#f5f5f5",
                 )
                 if legend_img:
                     ax_img.legend(
@@ -703,13 +711,19 @@ def plot_asset_dependency_network(
         save_path_obj = DEFAULT_IMAGE_DIR / DEFAULT_PRIMARY_FILENAME
 
     save_path_obj.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(save_path_obj, bbox_inches="tight")
+    arrow_suffix = "_colored" if colored_arrows else ""
+    if save_path_obj.suffix:
+        primary_path = save_path_obj.with_name(f"{save_path_obj.stem}{arrow_suffix}{save_path_obj.suffix}")
+    else:
+        primary_path = Path(f"{save_path_obj}{arrow_suffix}")
+
+    fig.savefig(primary_path, bbox_inches="tight")
     secondary_path: Path | None = None
     if include_map and secondary_fig is not None:
-        if save_path_obj.suffix:
-            secondary_path = save_path_obj.with_name(f"{save_path_obj.stem}_image{save_path_obj.suffix}")
+        if primary_path.suffix:
+            secondary_path = primary_path.with_name(f"{primary_path.stem}_image{primary_path.suffix}")
         else:
-            secondary_path = Path(str(save_path_obj) + "_image")
+            secondary_path = Path(f"{primary_path}_image")
         secondary_fig.savefig(secondary_path, bbox_inches="tight")
     if show:
         plt.show()
