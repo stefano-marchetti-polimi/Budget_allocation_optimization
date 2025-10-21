@@ -1,0 +1,1 @@
+NOAA (2025). Tides and Currents dataset for station 8770777 – Manchester, TX. Center for Operational Oceanographic Products and Services (CO-OPS). Available at: https://tidesandcurrents.noaa.gov/ (Accessed: 21 October 2025).
