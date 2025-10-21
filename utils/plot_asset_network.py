@@ -306,6 +306,9 @@ def _draw_geographic_network(
             shrinkB=20,
             mutation_scale=4,
             alpha=edge_alpha,
+            width = 1.5,
+            headwidth = 5,
+            headlength = 5,
         )
         arrow_kwargs["color"] = start_color if colored_arrows else edge_color
         ax.annotate(
