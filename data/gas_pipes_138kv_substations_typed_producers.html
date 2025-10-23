@@ -1,0 +1,156 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Gas Pipelines + 138/345–400 kV + 138 kV Substations + Custom Nodes</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  html, body, #map { height: 100%; margin: 0; }
+  .legend { background: white; padding: 6px 8px; border-radius: 4px; line-height: 1.4; }
+  .swatch { display:inline-block; width:12px; height:12px; margin-right:6px; border-radius:2px; vertical-align:middle; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/osmtogeojson@3.0.0-beta.5/osmtogeojson.js"></script>
+<script>
+const map = L.map('map').setView([29.8,-94.7], 8);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 18, attribution: '&copy; OpenStreetMap contributors'
+}).addTo(map);
+
+// Layers
+const layerPipesGas = L.layerGroup().addTo(map);
+const layer138 = L.layerGroup().addTo(map);
+const layer345_400 = L.layerGroup().addTo(map);
+const layerSubs138 = L.layerGroup().addTo(map);
+const layerProducers = L.layerGroup().addTo(map);
+const layerUsers = L.layerGroup().addTo(map);
+
+// Styles
+function stylePipeGas() { return { color:'#007c7c', weight:3, opacity:0.9 }; }
+function styleLine138() { return { color:'#ff6600', weight:3, opacity:0.9 }; }
+function styleLineHV() { return { color:'#8a2be2', weight:3, opacity:0.9 }; }
+function styleSub138(feature) {
+  if (feature.geometry && feature.geometry.type === 'Point') { return null; }
+  return { color:'#1f4aff', weight:2, fillColor:'#1f4aff', fillOpacity:0.3 };
+}
+function pointStyle(color) { return { radius: 6, fillColor: color, color: '#000', weight: 1, opacity: 1, fillOpacity: 0.9 }; }
+
+// BBox
+const bbox = "(28.2,-95.8,30.6,-93.0)";
+
+// Gas pipelines
+const qPipes = `[out:json][timeout:60];
+(
+  way["man_made"="pipeline"]["substance"~"^(gas|natural_gas)$"]${bbox};
+  way["man_made"="pipeline"]["product"~"^(gas|natural_gas)$"]${bbox};
+  relation["type"="pipeline"]["substance"~"^(gas|natural_gas)$"]${bbox};
+  relation["type"="pipeline"]["product"~"^(gas|natural_gas)$"]${bbox};
+);
+out geom;`.replace("{bbox}", bbox);
+fetch("https://overpass-api.de/api/interpreter", { method: "POST", body: qPipes })
+  .then(r => r.json()).then(d => { L.geoJSON(osmtogeojson(d), { style: stylePipeGas }).addTo(layerPipesGas); });
+
+// 138 kV lines
+const q138 = `[out:json][timeout:60];
+(
+  way["power"="line"]["voltage"~"(^|;)\\s*138(\\s*kV|000)?\\s*($|;)"]${bbox};
+  relation["route"="power"]["voltage"~"(^|;)\\s*138(\\s*kV|000)?\\s*($|;)"]${bbox};
+);
+out geom;`.replace("{bbox}", bbox);
+fetch("https://overpass-api.de/api/interpreter", { method: "POST", body: q138 })
+  .then(r => r.json()).then(d => { L.geoJSON(osmtogeojson(d), { style: styleLine138 }).addTo(layer138); });
+
+// 345–400 kV lines (context)
+const qHV = `[out:json][timeout:60];
+(
+  way["power"="line"]["voltage"~"(^|;)\\s*(345|400)(\\s*kV|000)?\\s*($|;)"]${bbox};
+  relation["route"="power"]["voltage"~"(^|;)\\s*(345|400)(\\s*kV|000)?\\s*($|;)"]${bbox};
+);
+out geom;`.replace("{bbox}", bbox);
+fetch("https://overpass-api.de/api/interpreter", { method: "POST", body: qHV })
+  .then(r => r.json()).then(d => { L.geoJSON(osmtogeojson(d), { style: styleLineHV }).addTo(layer345_400); });
+
+// 138 kV substations only
+const qSubs138 = `[out:json][timeout:60];
+(
+  node["power"="substation"]["voltage"~"(^|;)\\s*138(\\s*kV|000)?\\s*($|;)"]${bbox};
+  way ["power"="substation"]["voltage"~"(^|;)\\s*138(\\s*kV|000)?\\s*($|;)"]${bbox};
+  relation["power"="substation"]["voltage"~"(^|;)\\s*138(\\s*kV|000)?\\s*($|;)"]${bbox};
+);
+out geom;`.replace("{bbox}", bbox);
+fetch("https://overpass-api.de/api/interpreter", { method: "POST", body: qSubs138 })
+  .then(r => r.json())
+  .then(data => {
+    const gj = osmtogeojson(data);
+    L.geoJSON(gj, {
+      style: styleSub138,
+      pointToLayer: (f, latlng) => L.circleMarker(latlng, pointStyle('#1f4aff')),
+      onEachFeature: (f, layer) => {
+        const name = (f.properties && (f.properties.tags && f.properties.tags.name)) || '138 kV Substation';
+        layer.bindPopup(name);
+      }
+    }).addTo(layerSubs138);
+  });
+
+// Producers with color by type
+const producersGeoJSON = {"type": "FeatureCollection", "features": [{"type": "Feature", "geometry": {"type": "Point", "coordinates": [-93.288861, 30.284383]}, "properties": {"id": 1, "category": "Producer", "type": "Producer"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-95.258, 29.2631]}, "properties": {"id": 2, "category": "Producer", "type": "Producer"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-94.5151, 28.8557]}, "properties": {"id": 3, "category": "Producer", "type": "Producer"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-94.7237, 28.3541]}, "properties": {"id": 4, "category": "Producer", "type": "Producer"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-93.5647, 29.3931]}, "properties": {"id": 5, "category": "Producer", "type": "Producer"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-93.878, 30.0242]}, "properties": {"id": 6, "category": "Producer", "type": "Gas"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-93.29906, 30.272631]}, "properties": {"id": 7, "category": "Producer", "type": "Gas"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-94.9256, 29.75]}, "properties": {"id": 8, "category": "Producer", "type": "Gas"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-93.7353, 30.2588]}, "properties": {"id": 9, "category": "Producer", "type": "Gas"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-95.12174, 29.836952]}, "properties": {"id": 10, "category": "Producer", "type": "Gas"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-94.98483, 29.49233]}, "properties": {"id": 11, "category": "Producer", "type": "Gas"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-94.93277, 29.378097]}, "properties": {"id": 12, "category": "Producer", "type": "Gas"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-95.40748, 28.991289]}, "properties": {"id": 13, "category": "Producer", "type": "Gas"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-93.95098, 29.888462]}, "properties": {"id": 14, "category": "Producer", "type": "Gas"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-93.3239475, 29.7742723]}, "properties": {"id": 15, "category": "Producer", "type": "Gas"}}]};
+function colorByType(t) {
+  if (!t) return '#b22222';
+  const k = t.toLowerCase();
+  if (k === 'gas') return '#2e8b57';      // green for Gas
+  return '#d95f02';                       // orange for 'Producer' type
+}
+
+L.geoJSON(producersGeoJSON, {
+  pointToLayer: (f, latlng) => L.circleMarker(latlng, pointStyle(colorByType(f.properties.type))),
+  onEachFeature: (f, layer) => layer.bindPopup(`<b>Producer</b><br>Type: ${f.properties.type}<br>ID: ${f.properties.id}`)
+}).addTo(layerProducers);
+
+// Users
+const usersGeoJSON = {"type": "FeatureCollection", "features": [{"type": "Feature", "geometry": {"type": "Point", "coordinates": [-95.4333, 29.167]}, "properties": {"id": 1, "category": "User"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-94.795, 29.301]}, "properties": {"id": 2, "category": "User"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-94.6864, 29.753]}, "properties": {"id": 3, "category": "User"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-94.3452, 32.757]}, "properties": {"id": 4, "category": "User"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-93.7366, 30.093]}, "properties": {"id": 5, "category": "User"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-94.7391, 30.152]}, "properties": {"id": 6, "category": "User"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-94.8106, 30.163]}, "properties": {"id": 7, "category": "User"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-95.3103, 29.775]}, "properties": {"id": 8, "category": "User"}}, {"type": "Feature", "geometry": {"type": "Point", "coordinates": [-95.8143, 29.569]}, "properties": {"id": 9, "category": "User"}}]};
+L.geoJSON(usersGeoJSON, {
+  pointToLayer: (f, latlng) => L.circleMarker(latlng, pointStyle('#1f4aff')),
+  onEachFeature: (f, layer) => layer.bindPopup(`<b>User</b><br>ID: ${f.properties.id}`)
+}).addTo(layerUsers);
+
+// Fit bounds
+setTimeout(() => {
+  try {
+    const group = L.featureGroup([layerPipesGas, layer138, layer345_400, layerSubs138, layerProducers, layerUsers]);
+    const b = group.getBounds();
+    if (b.isValid()) map.fitBounds(b.pad(0.1));
+  } catch (e) {}
+}, 2500);
+
+// Controls
+L.control.layers(null, {
+  "Natural Gas Pipelines": layerPipesGas,
+  "138 kV Lines": layer138,
+  "345–400 kV Lines": layer345_400,
+  "138 kV Substations": layerSubs138,
+  "Producers (typed)": layerProducers,
+  "Users": layerUsers
+}, { collapsed: false }).addTo(map);
+
+// Legend
+const legend = L.control({position: 'topright'});
+legend.onAdd = function () {
+  const div = L.DomUtil.create('div', 'legend');
+  div.innerHTML =
+    '<div><span class="swatch" style="background:#007c7c"></span>Natural Gas Pipeline</div>' +
+    '<div><span class="swatch" style="background:#ff6600"></span>138 kV Line</div>' +
+    '<div><span class="swatch" style="background:#8a2be2"></span>345–400 kV Line (context)</div>' +
+    '<div><span class="swatch" style="background:#1f4aff"></span>138 kV Substation</div>' +
+    '<div><span class="swatch" style="background:#2e8b57"></span>Producer (Gas)</div>' +
+    '<div><span class="swatch" style="background:#d95f02"></span>Producer (Other)</div>' +
+    '<div><span class="swatch" style="background:#1f4aff"></span>User</div>';
+  return div;
+};
+legend.addTo(map);
+</script>
+</body>
+</html>
