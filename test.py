@@ -19,13 +19,13 @@ from stable_baselines3 import PPO
 # -------------------- Evaluation configuration --------------------
 # Set USE_BEST_MODEL to True to load the best model saved during evaluation (results/best_models/best_model.zip by default).
 # If False, you can fall back to the latest checkpoint or a manually specified policy path.
-USE_BEST_MODEL = True
+USE_BEST_MODEL = False
 BEST_MODEL_FILENAME = "best_model.zip"
 
 # Set USE_LATEST_CHECKPOINT to True to automatically load the newest checkpoint inside
 # results/checkpoints. Set it to False and provide POLICY_PATH (with or without .zip)
 # to evaluate a specific file. Ignored when USE_BEST_MODEL is True.
-USE_LATEST_CHECKPOINT = False
+USE_LATEST_CHECKPOINT = True
 POLICY_PATH = None  # Only used when USE_LATEST_CHECKPOINT is False
 
 # Stable-Baselines device string (e.g., "cpu", "mps", "cuda").
@@ -36,7 +36,7 @@ EVAL_SEED = 1042
 
 # Deterministic evaluation runs a single greedy episode.
 # Set to False to sample actions; STOCHASTIC_EPISODES controls how many rollouts to average.
-DETERMINISTIC_EVAL = True
+DETERMINISTIC_EVAL = False
 STOCHASTIC_EPISODES = 10
 
 from optimization_parallel import (

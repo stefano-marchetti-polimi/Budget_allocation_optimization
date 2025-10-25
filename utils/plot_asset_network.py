@@ -1,14 +1,16 @@
 """Plot the dependency network of assets in the TrialEnv environment.
 
 The relationships mirror the logical dependencies implemented in
-``utils.environment_placeholder.TrialEnv._compute_metrics`` where service
-availability propagates across assets such as PV, substations, compressors,
-the thermal unit, and the LNG terminal.
+``utils.environment.TrialEnv._compute_metrics`` where service
+availability propagates across components such as generation, compressors,
+substations, and the LNG terminal.
 """
 
 from __future__ import annotations
 
 import math
+import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Mapping, Sequence, Tuple
 import warnings
@@ -25,95 +27,87 @@ from matplotlib import patheffects
 from matplotlib.lines import Line2D
 from rasterio.plot import plotting_extent
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils.environment import ASSET_COORD_CRS, _build_default_network
+
 __all__ = ["plot_asset_dependency_network"]
 
-# Directed dependencies: each asset lists the upstream components it requires
-# to be operational. Edges are drawn from dependency -> dependent.
-BASE_ASSET_DEPENDENCIES: Mapping[str, Sequence[str]] = {
-    "Substation2": ("PV",),
-    "Compressor1": ("LNG", "Substation1", "Substation2"),
-    "Compressor2": ("LNG", "Substation1", "Substation2"),
-    "Compressor3": ("LNG", "Substation1", "Substation2"),
-    "ThermalUnit": ("Compressor3",),
-    "Substation1": ("ThermalUnit",),
+# Presentation metadata for component categories.
+CATEGORY_LABELS: Mapping[str, str] = {
+    "renewable": "Renewable Generation",
+    "thermal": "Thermal Generation",
+    "lng": "Fuel Supply",
+    "compressor": "Gas Compression",
+    "substation": "Electrical Distribution",
 }
 
-# Asset categories drive node styling on the plot.
-ASSET_TYPE_MAP: Mapping[str, str] = {
-    "PV": "Renewable Generation",
-    "ThermalUnit": "Thermal Generation",
-    "LNG": "Fuel Supply",
-    "Substation1": "Electrical Distribution",
-    "Substation2": "Electrical Distribution",
-    "Compressor1": "Gas Compression",
-    "Compressor2": "Gas Compression",
-    "Compressor3": "Gas Compression",
+CATEGORY_COLORS: Mapping[str, str] = {
+    "renewable": "#5ab4ac",
+    "thermal": "#b8860b",
+    "lng": "#6c93ff",
+    "compressor": "#80b1d3",
+    "substation": "#c7e9c0",
+    "unclassified": "#bdbdbd",
 }
 
-ASSET_TYPE_COLORS: Mapping[str, str] = {
-    "Renewable Generation": "#5ab4ac",
-    "Thermal Generation": "#b8860b",
-    "Fuel Supply": "#6c93ff",
-    "Electrical Distribution": "#c7e9c0",
-    "Gas Compression": "#80b1d3",
-    "Unclassified": "#bdbdbd",
-}
-
-# Optional edge labels to highlight the role of key connections.
-BASE_EDGE_LABELS: Dict[Tuple[str, str], str] = {}
-
-# Manually chosen coordinates to keep the diagram easy to read.
-BASE_MANUAL_POSITIONS: Mapping[str, Tuple[float, float]] = {
-    # Anchor sources far apart so downstream edges do not stack.
-    "PV": (-10.0, 4.5),
-    "LNG": (12.0, 6.0),
-    # Downstream assets arranged to follow the logical flow left-to-right.
-    "Substation2": (-5.0, 3.2),
-    "Compressor1": (1.0, 7.5),
-    "Compressor2": (1.0, 2.2),
-    "Compressor3": (1.0, -3.0),
-    "ThermalUnit": (3.5, -5.5),
-    "Substation1": (10.0, 0.0),
-}
-
-# Real-world coordinates for assets as used in the hazard sampling workflow.
-BASE_ASSET_COORDINATES: Mapping[str, Tuple[float, float]] = {
-    "PV": (415337.819, 3321791.508),
-    "Substation1": (471235.458, 3349033.547),
-    "Substation2": (313798.678, 3292636.851),
-    "Compressor1": (429265.789, 3347691.776),
-    "Compressor2": (295005.562, 3302607.527),
-    "Compressor3": (307580.921, 3264174.781),
-    "ThermalUnit": (312418.912, 3251429.175),
-    "LNG": (265455.097, 3209409.708),
-}
-
-ASSET_COORD_CRS = "EPSG:32615"
-DEFAULT_DEM_PATH = Path("data/houston_example_DEM_30m.tif")
-DEFAULT_BACKGROUND_IMAGE = Path("data/inun_zero_depth.png")
-REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CATEGORY_LABEL = "Unclassified"
+DEFAULT_DEM_PATH = REPO_ROOT / "data" / "houston_example_DEM_30m.tif"
+DEFAULT_BACKGROUND_IMAGE = REPO_ROOT / "data" / "inun_zero_depth.png"
 DEFAULT_IMAGE_DIR = REPO_ROOT / "Images"
 DEFAULT_PRIMARY_FILENAME = "asset_dependency_map.png"
 
 
+@lru_cache(maxsize=1)
+def _network_snapshot() -> Dict[str, object]:
+    network = _build_default_network(REPO_ROOT / "data")
+    dependencies = {
+        cfg.name: tuple(cfg.dependencies)
+        for cfg in network.components
+        if cfg.dependencies
+    }
+    edges: set[Tuple[str, str]] = set()
+    for cfg in network.components:
+        for dep in cfg.dependencies:
+            edges.add((dep, cfg.name))
+        for source in cfg.generator_sources:
+            edges.add((source, cfg.name))
+    category_map = {cfg.name: cfg.category for cfg in network.components}
+    coordinates = {
+        cfg.name: tuple(cfg.coordinate)
+        for cfg in network.components
+        if cfg.coordinate is not None
+    }
+    components = {cfg.name: cfg for cfg in network.components}
+    return {
+        "dependencies": dependencies,
+        "edges": tuple(sorted(edges)),
+        "category_map": category_map,
+        "coordinates": coordinates,
+        "components": components,
+    }
+
+
 def _dependency_map() -> Dict[str, Sequence[str]]:
-    return dict(BASE_ASSET_DEPENDENCIES)
+    snapshot = _network_snapshot()
+    return {asset: deps[:] for asset, deps in snapshot["dependencies"].items()}
 
 
 def _edge_labels() -> Dict[Tuple[str, str], str]:
-    return dict(BASE_EDGE_LABELS)
-
-
-def _manual_positions() -> Dict[str, Tuple[float, float]]:
-    return dict(BASE_MANUAL_POSITIONS)
+    return {}
 
 
 def _collect_assets(dependency_map: Mapping[str, Sequence[str]]) -> Sequence[str]:
-    """Gather the unique set of assets present in the dependency map."""
-    downstream = set(dependency_map.keys())
-    upstream = {asset for deps in dependency_map.values() for asset in deps}
-    ordered = list(dict.fromkeys(list(upstream) + list(downstream)))
-    return sorted(ordered)
+    snapshot = _network_snapshot()
+    nodes = sorted(snapshot["components"].keys())
+    return nodes
+
+
+def _edge_list() -> Sequence[Tuple[str, str]]:
+    snapshot = _network_snapshot()
+    return list(snapshot["edges"])
 
 
 def _circular_layout(nodes: Sequence[str], radius: float = 2.5) -> Dict[str, Tuple[float, float]]:
@@ -126,24 +120,51 @@ def _circular_layout(nodes: Sequence[str], radius: float = 2.5) -> Dict[str, Tup
     return positions
 
 
-def _compute_positions(nodes: Sequence[str]) -> Dict[str, Tuple[float, float]]:
-    """Get plotting coordinates based on predefined manual positions."""
-    manual_positions = _manual_positions()
-    positions = {node: manual_positions[node] for node in nodes if node in manual_positions}
+def _compute_positions(nodes: Sequence[str], coord_map: Mapping[str, Tuple[float, float]]) -> Dict[str, Tuple[float, float]]:
+    """Derive 2-D positions from geographic coordinates for schematic plotting."""
+    available = {node: coord_map[node] for node in nodes if node in coord_map}
+    if not available:
+        return _circular_layout(nodes)
+    eastings = np.array([coord[0] for coord in available.values()], dtype=np.float32)
+    northings = np.array([coord[1] for coord in available.values()], dtype=np.float32)
+    min_e, max_e = float(eastings.min()), float(eastings.max())
+    min_n, max_n = float(northings.min()), float(northings.max())
+    width = max(max_e - min_e, 1.0)
+    height = max(max_n - min_n, 1.0)
+    positions: Dict[str, Tuple[float, float]] = {}
+    for node in nodes:
+        coord = coord_map.get(node)
+        if coord is None:
+            continue
+        x_norm = ((coord[0] - min_e) / width) * 2.0 - 1.0
+        y_norm = ((coord[1] - min_n) / height) * 2.0 - 1.0
+        positions[node] = (x_norm, y_norm)
     missing = [node for node in nodes if node not in positions]
     if missing:
-        positions.update(_circular_layout(missing))
+        positions.update(_circular_layout(missing, radius=1.3))
     return positions
 
 
+def _asset_category(asset: str) -> str:
+    snapshot = _network_snapshot()
+    return snapshot["category_map"].get(asset, "unclassified")
+
+
 def _categorize_asset(asset: str) -> str:
-    """Return the display category for the requested asset."""
-    return ASSET_TYPE_MAP.get(asset, "Unclassified")
+    """Return the display category label for the requested asset."""
+    category = _asset_category(asset)
+    return CATEGORY_LABELS.get(category, DEFAULT_CATEGORY_LABEL)
+
+
+def _asset_color(asset: str) -> str:
+    category = _asset_category(asset)
+    return CATEGORY_COLORS.get(category, CATEGORY_COLORS["unclassified"])
 
 
 def _asset_coordinate_map() -> Dict[str, Tuple[float, float]]:
     """Return a mapping of asset -> (Easting, Northing) coordinates."""
-    return dict(BASE_ASSET_COORDINATES)
+    snapshot = _network_snapshot()
+    return dict(snapshot["coordinates"])
 
 
 def _map_extent(coords: Mapping[str, Tuple[float, float]]) -> Tuple[float, float, float, float]:
@@ -298,8 +319,7 @@ def _draw_geographic_network(
             if end_coord is None:
                 missing_assets.add(end)
             continue
-        start_asset_type = _categorize_asset(start)
-        start_color = ASSET_TYPE_COLORS.get(start_asset_type, ASSET_TYPE_COLORS["Unclassified"])
+        start_color = _asset_color(start)
         arrow_kwargs = dict(
             linewidth=edge_linewidth,
             shrinkA=6,
@@ -349,7 +369,7 @@ def _draw_geographic_network(
             missing_assets.add(node)
             continue
         asset_type = _categorize_asset(node)
-        color = ASSET_TYPE_COLORS.get(asset_type, ASSET_TYPE_COLORS["Unclassified"])
+        color = _asset_color(node)
         ax.scatter(
             [coord[0]],
             [coord[1]],
@@ -457,7 +477,7 @@ def _draw_network_overlay(
             missing_assets.add(node)
             continue
         asset_type = _categorize_asset(node)
-        color = ASSET_TYPE_COLORS.get(asset_type, ASSET_TYPE_COLORS["Unclassified"])
+        color = _asset_color(node)
         ax.scatter(
             [coord[0]],
             [coord[1]],
@@ -514,12 +534,9 @@ def plot_asset_dependency_network(
     """Plot asset dependencies and optionally overlay geographic locations on a map."""
     dependency_map = _dependency_map()
     nodes = _collect_assets(dependency_map)
-    edges = [
-        (dependency, asset)
-        for asset, dependencies in dependency_map.items()
-        for dependency in dependencies
-    ]
+    edges = list(_edge_list())
     edge_labels = _edge_labels()
+    coord_map_full = _asset_coordinate_map()
 
     secondary_fig: plt.Figure | None = None
 
@@ -532,7 +549,6 @@ def plot_asset_dependency_network(
         fig = ax.figure
 
     if include_map:
-        coord_map_full = _asset_coordinate_map()
         relevant_coords = {node: coord_map_full[node] for node in nodes if node in coord_map_full}
         if not relevant_coords:
             raise ValueError("No geographic coordinates available for the requested assets.")
@@ -611,7 +627,7 @@ def plot_asset_dependency_network(
                 )
                 secondary_fig = None
     else:
-        positions = _compute_positions(nodes)
+        positions = _compute_positions(nodes, coord_map_full)
         ax.set_aspect("equal")
         ax.axis("off")
         ax.margins(0.2)
@@ -662,7 +678,7 @@ def plot_asset_dependency_network(
         for node in nodes:
             x, y = positions[node]
             asset_type = _categorize_asset(node)
-            color = ASSET_TYPE_COLORS.get(asset_type, ASSET_TYPE_COLORS["Unclassified"])
+            color = _asset_color(node)
             ax.scatter(
                 [x],
                 [y],

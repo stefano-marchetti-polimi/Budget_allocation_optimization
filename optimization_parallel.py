@@ -6,6 +6,7 @@ import math
 import json
 import csv
 import shutil
+from pathlib import Path
 from typing import Sequence
 import numpy as np
 import torch
@@ -13,20 +14,24 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import gymnasium as gym
 
+from utils.environment import TrialEnv, _build_default_network  # must be importable at top level
+
 # -------------------- User parameters --------------------
-SCENARIO_NAME = "neutral"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social)
+SCENARIO_NAME = "gas-economic"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social)
 CLIMATE_SCENARIO = "SSP5-8.5"  # sea level rise projections (SSP1-1.9, SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5, All)
 BUDGET = 500000
-MC_SAMPLES = 50000
+MC_SAMPLES = 1000
 
-num_nodes = 8
+PROJECT_ROOT = Path(__file__).resolve().parent
+_NETWORK_CONFIG = _build_default_network(PROJECT_ROOT / "data")
+num_nodes = len(_NETWORK_CONFIG.components)
 years = 75 # until 2100
 year_step = 5 # 15 decisions
-RL_steps = 5000000
+RL_steps = 5000000*5
 learning_rate = 5e-4
 
 # Per-asset footprint areas (m^2)
-area = np.array([100, 150, 150, 50, 50, 50, 200, 300], dtype=np.float32)
+area = np.array([cfg.area for cfg in _NETWORK_CONFIG.components], dtype=np.float32)
 
 
 #CAN TRY GAE_LAMBDA = 0.9 OR LARGER CRITIC NETWORK OR DIFFERENT LEARNING RATE IF EXPLAINED VARIANCE IS STILL LOW/NEGATIVE 
@@ -50,7 +55,6 @@ from stable_baselines3.common.callbacks import (
     CallbackList,
     CheckpointCallback,
 )
-from utils.environment import TrialEnv  # must be importable at top level
 
 WEIGHT_VECTOR_KEYS = ("W_g", "W_e", "W_ge", "W_gs", "W_ee", "W_es")
 
@@ -248,16 +252,7 @@ CHECKPOINT_DIR = os.path.join(RESULTS_DIR, "checkpoints")
 os.makedirs(BEST_MODEL_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-ASSET_NAMES = [
-    "PV",
-    "Substation1",
-    "Substation2",
-    "Compressor1",
-    "Compressor2",
-    "Compressor3",
-    "ThermalUnit",
-    "LNG",
-]
+ASSET_NAMES = [cfg.name for cfg in _NETWORK_CONFIG.components]
 
 
 def linear_schedule(start: float, end: float):
@@ -419,6 +414,12 @@ class InfoMetricsCallback(BaseCallback):
         self.prefix = prefix.rstrip("/")
         self.log_std = bool(log_std)
         self._buffer: dict[str, list[float]] = {key: [] for key in self.keys}
+        self._aliases = {
+            "over_budget_penalty_signed": "over_pen_signed",
+            "over_budget_penalty": "over_pen",
+            "unused_budget_penalty_signed": "unused_pen_signed",
+            "unused_budget_penalty": "unused_pen",
+        }
 
     def _init_buffer(self) -> None:
         self._buffer = {key: [] for key in self.keys}
@@ -440,9 +441,10 @@ class InfoMetricsCallback(BaseCallback):
             if not values:
                 continue
             arr = np.asarray(values, dtype=np.float32)
-            self.logger.record(f"{self.prefix}/{key}_mean", float(arr.mean()))
+            alias = self._aliases.get(key, key)
+            self.logger.record(f"{self.prefix}/{alias}_mean", float(arr.mean()))
             if self.log_std:
-                self.logger.record(f"{self.prefix}/{key}_std", float(arr.std()))
+                self.logger.record(f"{self.prefix}/{alias}_std", float(arr.std()))
         self._init_buffer()
         return True
 
