@@ -58,6 +58,7 @@ class ComponentConfig:
     coordinate: Optional[Tuple[float, float]] = None
     upgradable: bool = True
     can_fail: bool = True
+    industrial_load: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,8 @@ class NetworkConfig:
     compressor_people: Dict[str, float]
     substation_supply: Dict[str, float]
     substation_people: Dict[str, float]
+    compressor_industrial: Dict[str, float]
+    substation_industrial: Dict[str, float]
 
 
 def _format_component_name(raw: str) -> str:
@@ -222,6 +225,24 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
             continue
         population_map[_format_component_name(county)] = float(pop)
 
+    industrial_intensity_base = {
+        "Harris": 1.0,
+        "Jefferson": 0.85,
+        "Orange": 0.75,
+        "Brazoria": 0.7,
+        "Galveston": 0.6,
+        "Chambers": 0.65,
+        "Liberty": 0.4,
+        "Hardin": 0.35,
+        "Fort Bend": 0.45,
+        "Brazos": 0.35,
+    }
+    intensity_default = 0.3
+    industrial_intensity = {
+        _format_component_name(name): float(value)
+        for name, value in industrial_intensity_base.items()
+    }
+
     def _row_coordinate(row: Mapping[str, object]) -> Tuple[float, float]:
         east = row.get("Easting (m)")
         north = row.get("Northing (m)")
@@ -333,6 +354,13 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         "Comp_Freeport": ("Freeport_CCGT", "Bacliff_CCGT", "Galveston_CCGT"),
     }
 
+    compressor_counties = {
+        "Comp_Sabine": ("Jefferson", "Orange"),
+        "Comp_Calcasieu": ("Liberty", "Chambers", "Hardin"),
+        "Comp_CedarBayou": ("Harris",),
+        "Comp_Freeport": ("Brazoria", "Galveston", "Fort_Bend"),
+    }
+
     # Compressor stations (dependencies handled later)
     compressor_defs = {
         "Comp_Sabine": ("P4", ("Calcasieu_Pass_LNG",)),
@@ -340,12 +368,20 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         "Comp_CedarBayou": ("P6", ("Calcasieu_Pass_LNG",)),
         "Comp_Freeport": ("P5", ("Calcasieu_Pass_LNG",)),
     }
+    compressor_industrial_load: Dict[str, float] = {}
     for name, (hazard, deps) in compressor_defs.items():
         feed_assets = compressor_feeds.get(name, ())
         supply_capacity = sum(capacity_map.get(asset, 0.0) for asset in feed_assets)
         centroid = _weighted_centroid(feed_assets)
         if centroid is None:
             centroid = coordinate_map.get("Calcasieu_Pass_LNG")
+        counties = compressor_counties.get(name, ())
+        industrial_load = 0.0
+        for county in counties:
+            key = _format_component_name(county)
+            intensity = industrial_intensity.get(key, intensity_default)
+            industrial_load += population_map.get(key, 0.0) * intensity
+        compressor_industrial_load[name] = industrial_load
         components.append(
             ComponentConfig(
                 name=name,
@@ -357,6 +393,7 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
                 coordinate=centroid,
                 upgradable=True,
                 can_fail=True,
+                industrial_load=industrial_load,
             )
         )
         if centroid is not None:
@@ -395,12 +432,20 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         total = sum(population_map.get(_format_component_name(county), 0.0) for county in counties)
         substation_people[name] = total
 
+    substation_industrial_load: Dict[str, float] = {}
     for name, generators in substation_generators.items():
         capacity = sum(capacity_map.get(gen, 0.0) for gen in generators)
         population = substation_people.get(name, 0.0)
         centroid = _weighted_centroid(generators)
         if centroid is None:
             centroid = coordinate_map.get("Calcasieu_Pass_LNG")
+        counties = substation_counties.get(name, ())
+        industrial_load = 0.0
+        for county in counties:
+            key = _format_component_name(county)
+            intensity = industrial_intensity.get(key, intensity_default)
+            industrial_load += population_map.get(key, 0.0) * intensity
+        substation_industrial_load[name] = industrial_load
         components.append(
             ComponentConfig(
                 name=name,
@@ -411,6 +456,7 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
                 population=population,
                 capacity=capacity,
                 coordinate=centroid,
+                industrial_load=industrial_load,
             )
         )
         if centroid is not None:
@@ -421,12 +467,6 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
     for name, plants in compressor_feeds.items():
         compressor_supply[name] = sum(capacity_map.get(plant, 0.0) for plant in plants)
 
-    compressor_counties = {
-        "Comp_Sabine": ("Jefferson", "Orange"),
-        "Comp_Calcasieu": ("Liberty", "Chambers", "Hardin"),
-        "Comp_CedarBayou": ("Harris",),
-        "Comp_Freeport": ("Brazoria", "Galveston", "Fort_Bend"),
-    }
     compressor_people: Dict[str, float] = {}
     for name, counties in compressor_counties.items():
         compressor_people[name] = sum(population_map.get(_format_component_name(county), 0.0) for county in counties)
@@ -439,6 +479,8 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         compressor_people=compressor_people,
         substation_supply=substation_supply,
         substation_people=substation_people,
+        compressor_industrial=compressor_industrial_load,
+        substation_industrial=substation_industrial_load,
     )
 
 class TrialEnv(gym.Env):
@@ -481,6 +523,7 @@ class TrialEnv(gym.Env):
         repeat_asset_penalty: float = -0.1,
         reward_scale: float = 60000.0,
         cost_weight: float = 0.08,
+        industrial_weight: float = 0.6,
     ):
         super().__init__()
         assert num_nodes >= 1, "num_nodes must be >= 1"
@@ -580,6 +623,7 @@ class TrialEnv(gym.Env):
         self.max_duration = float(max_duration)
         self.reward_scale = float(reward_scale)
         self.cost_weight = float(cost_weight)
+        self.industrial_weight = float(np.clip(industrial_weight, 0.0, 1.0))
 
         # Load enlarged network configuration from asset and population data
         project_root = Path(__file__).resolve().parents[1]
@@ -694,6 +738,17 @@ class TrialEnv(gym.Env):
             "substation population",
         )
 
+        self.compressor_industrial = _array_from_mapping(
+            self.compressor_order,
+            network_config.compressor_industrial,
+            "compressor industrial",
+        )
+        self.substation_industrial = _array_from_mapping(
+            self.substation_order,
+            network_config.substation_industrial,
+            "substation industrial",
+        )
+
         self.compressor_names = list(self.compressor_order)
         self.substation_names = list(self.substation_order)
         self.lng_names = [cfg.name for cfg in self.component_specs if cfg.category == "lng"]
@@ -707,6 +762,8 @@ class TrialEnv(gym.Env):
         self.total_gas_people = float(self.compressor_people.sum())
         self.total_power_supply = float(self.substation_power_supply.sum())
         self.total_power_people = float(self.substation_people.sum())
+        self.total_gas_industrial = float(self.compressor_industrial.sum())
+        self.total_power_industrial = float(self.substation_industrial.sum())
 
         if self.total_gas_supply > 0.0:
             self.compressor_supply_fraction = (self.compressor_gas_supply / self.total_gas_supply).astype(np.float32)
@@ -727,6 +784,16 @@ class TrialEnv(gym.Env):
             self.substation_people_fraction = (self.substation_people / self.total_power_people).astype(np.float32)
         else:
             self.substation_people_fraction = np.zeros_like(self.substation_people, dtype=np.float32)
+
+        if self.total_gas_industrial > 0.0:
+            self.compressor_industrial_fraction = (self.compressor_industrial / self.total_gas_industrial).astype(np.float32)
+        else:
+            self.compressor_industrial_fraction = np.zeros_like(self.compressor_industrial, dtype=np.float32)
+
+        if self.total_power_industrial > 0.0:
+            self.substation_industrial_fraction = (self.substation_industrial / self.total_power_industrial).astype(np.float32)
+        else:
+            self.substation_industrial_fraction = np.zeros_like(self.substation_industrial, dtype=np.float32)
 
         if initial_wall_height is None:
             self.initial_wall_height = np.zeros(self.N, dtype=np.float32)
@@ -772,6 +839,7 @@ class TrialEnv(gym.Env):
         self.gas_soc_mean = 0.0
         self.elec_soc_mean = 0.0
         self._last_positive_mask = np.zeros(self.N, dtype=bool)
+        self._latest_breakdown: Dict[str, float] = {}
 
         # --- Cache CSV and per-row values for fast nearest-neighbour lookup ---
         df_raw = pd.read_csv(self.csv_path, sep=None, engine='python', header=0, index_col=0)
@@ -1048,23 +1116,52 @@ class TrialEnv(gym.Env):
         gas_services = np.stack([availability[name] for name in self.compressor_order])
         gas_downtime = np.stack([component_downtime[name] for name in self.compressor_order])
         gas_time_ratio = np.clip(gas_downtime / max_event_time, a_min=0.0, a_max=1.0)
-        gas_outage_fraction = (1.0 - gas_services.astype(np.float32)) * self.compressor_supply_fraction[:, None]
-        gas_loss_samples = (gas_outage_fraction * gas_time_ratio).sum(axis=0)
-        gas_social_fraction = (1.0 - gas_services.astype(np.float32)) * self.compressor_people_fraction[:, None]
+        gas_unavailable = 1.0 - gas_services.astype(np.float32)
+        gas_supply_fraction = gas_unavailable * self.compressor_supply_fraction[:, None]
+        gas_supply_loss_samples = (gas_supply_fraction * gas_time_ratio).sum(axis=0)
+        gas_industrial_fraction = gas_unavailable * self.compressor_industrial_fraction[:, None]
+        gas_industrial_loss_samples = (gas_industrial_fraction * gas_time_ratio).sum(axis=0)
+        gas_loss_samples = (
+            (1.0 - self.industrial_weight) * gas_supply_loss_samples
+            + self.industrial_weight * gas_industrial_loss_samples
+        )
+        gas_social_fraction = gas_unavailable * self.compressor_people_fraction[:, None]
         gas_social_samples = (gas_social_fraction * gas_time_ratio).sum(axis=0)
 
         power_services = np.stack([availability[name] for name in self.substation_order])
         power_downtime = np.stack([component_downtime[name] for name in self.substation_order])
         power_time_ratio = np.clip(power_downtime / max_event_time, a_min=0.0, a_max=1.0)
-        power_outage_fraction = (1.0 - power_services.astype(np.float32)) * self.substation_supply_fraction[:, None]
-        electricity_loss_samples = (power_outage_fraction * power_time_ratio).sum(axis=0)
-        power_social_fraction = (1.0 - power_services.astype(np.float32)) * self.substation_people_fraction[:, None]
+        power_unavailable = 1.0 - power_services.astype(np.float32)
+        power_supply_fraction = power_unavailable * self.substation_supply_fraction[:, None]
+        power_supply_loss_samples = (power_supply_fraction * power_time_ratio).sum(axis=0)
+        power_industrial_fraction = power_unavailable * self.substation_industrial_fraction[:, None]
+        power_industrial_loss_samples = (power_industrial_fraction * power_time_ratio).sum(axis=0)
+        electricity_loss_samples = (
+            (1.0 - self.industrial_weight) * power_supply_loss_samples
+            + self.industrial_weight * power_industrial_loss_samples
+        )
+        power_social_fraction = power_unavailable * self.substation_people_fraction[:, None]
         electricity_social_samples = (power_social_fraction * power_time_ratio).sum(axis=0)
 
+        gas_supply_mean = float(gas_supply_loss_samples.mean())
+        gas_industrial_mean = float(gas_industrial_loss_samples.mean())
         gas_loss_mean = float(gas_loss_samples.mean())
+        elec_supply_mean = float(power_supply_loss_samples.mean())
+        elec_industrial_mean = float(power_industrial_loss_samples.mean())
         elec_loss_mean = float(electricity_loss_samples.mean())
         gas_social_mean = float(gas_social_samples.mean())
         elec_social_mean = float(electricity_social_samples.mean())
+
+        self._latest_breakdown = {
+            "gas_supply_mean": gas_supply_mean,
+            "gas_industrial_mean": gas_industrial_mean,
+            "gas_total_mean": gas_loss_mean,
+            "elec_supply_mean": elec_supply_mean,
+            "elec_industrial_mean": elec_industrial_mean,
+            "elec_total_mean": elec_loss_mean,
+            "gas_social_mean": gas_social_mean,
+            "elec_social_mean": elec_social_mean,
+        }
 
         depth_means = {
             name: float(depth_samples[name].mean() + offset)
@@ -1311,6 +1408,14 @@ class TrialEnv(gym.Env):
             "climate_drift": float(climate_drift),
             "action_gain": float(action_gain),
         }
+        breakdown = getattr(self, "_latest_breakdown", None)
+        if breakdown:
+            info["gas_supply_loss_mean"] = float(breakdown.get("gas_supply_mean", 0.0))
+            info["gas_industrial_loss_mean"] = float(breakdown.get("gas_industrial_mean", 0.0))
+            info["elec_supply_loss_mean"] = float(breakdown.get("elec_supply_mean", 0.0))
+            info["elec_industrial_loss_mean"] = float(breakdown.get("elec_industrial_mean", 0.0))
+            info["gas_social_loss_mean"] = float(breakdown.get("gas_social_mean", 0.0))
+            info["elec_social_loss_mean"] = float(breakdown.get("elec_social_mean", 0.0))
         info["repeat_penalty"] = float(repeat_penalty_total)
         if self._active_climate_scenario is not None:
             info["climate_scenario"] = self._active_climate_scenario

@@ -17,7 +17,7 @@ import gymnasium as gym
 from utils.environment import TrialEnv, _build_default_network  # must be importable at top level
 
 # -------------------- User parameters --------------------
-SCENARIO_NAME = "gas-economic"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social)
+SCENARIO_NAME = "electricity-social"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social)
 CLIMATE_SCENARIO = "SSP5-8.5"  # sea level rise projections (SSP1-1.9, SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5, All)
 BUDGET = 500000
 MC_SAMPLES = 1000
@@ -27,7 +27,7 @@ _NETWORK_CONFIG = _build_default_network(PROJECT_ROOT / "data")
 num_nodes = len(_NETWORK_CONFIG.components)
 years = 75 # until 2100
 year_step = 5 # 15 decisions
-RL_steps = 5000000*5
+RL_steps = 5000000*4
 learning_rate = 5e-4
 
 # Per-asset footprint areas (m^2)
@@ -419,6 +419,12 @@ class InfoMetricsCallback(BaseCallback):
             "over_budget_penalty": "over_pen",
             "unused_budget_penalty_signed": "unused_pen_signed",
             "unused_budget_penalty": "unused_pen",
+            "gas_supply_loss_mean": "gas_supply",
+            "gas_industrial_loss_mean": "gas_ind",
+            "elec_supply_loss_mean": "elec_supply",
+            "elec_industrial_loss_mean": "elec_ind",
+            "gas_social_loss_mean": "gas_soc",
+            "elec_social_loss_mean": "elec_soc",
         }
 
     def _init_buffer(self) -> None:
@@ -574,6 +580,12 @@ def main():
         "total_cost",
         "unused_budget",
         "over_budget_amount",
+        "gas_supply_loss_mean",
+        "gas_industrial_loss_mean",
+        "elec_supply_loss_mean",
+        "elec_industrial_loss_mean",
+        "gas_social_loss_mean",
+        "elec_social_loss_mean",
     )
     info_callback = InfoMetricsCallback(keys=info_keys, prefix="train/info", verbose=0)
 
