@@ -8,10 +8,12 @@ substations, and the LNG terminal.
 
 from __future__ import annotations
 
+from itertools import filterfalse
 import math
 import sys
 from functools import lru_cache
 from pathlib import Path
+from tkinter import FALSE
 from typing import Dict, Mapping, Sequence, Tuple
 import warnings
 
@@ -87,6 +89,12 @@ def _network_snapshot() -> Dict[str, object]:
         "category_map": category_map,
         "coordinates": coordinates,
         "components": components,
+        "compressor_people": network.compressor_people,
+        "compressor_industrial": network.compressor_industrial,
+        "compressor_supply": network.compressor_supply,
+        "substation_people": network.substation_people,
+        "substation_industrial": network.substation_industrial,
+        "substation_supply": network.substation_supply,
     }
 
 
@@ -320,17 +328,28 @@ def _draw_geographic_network(
                 missing_assets.add(end)
             continue
         start_color = _asset_color(start)
-        arrow_kwargs = dict(
-            linewidth=edge_linewidth,
-            shrinkA=6,
-            shrinkB=20,
-            mutation_scale=4,
-            alpha=edge_alpha,
-            width = 1.5,
-            headwidth = 5,
-            headlength = 5,
-        )
-        arrow_kwargs["color"] = start_color if colored_arrows else edge_color
+        if colored_arrows:
+            arrow_kwargs = dict(
+                arrowstyle="-|>",
+                linewidth=edge_linewidth,
+                shrinkA=4,
+                shrinkB=10,
+                mutation_scale=12,
+                alpha=edge_alpha,
+                color=start_color,
+                joinstyle="miter",
+            )
+        else:
+            arrow_kwargs = dict(
+                arrowstyle="-|>",
+                linewidth=edge_linewidth,
+                shrinkA=4,
+                shrinkB=10,
+                mutation_scale=12,
+                alpha=edge_alpha,
+                color=edge_color,
+                joinstyle="miter",
+            )
         ax.annotate(
             "",
             xy=end_coord,
@@ -529,7 +548,10 @@ def plot_asset_dependency_network(
     include_map: bool = True,
     dem_path: str | Path | None = DEFAULT_DEM_PATH,
     background_image: str | Path | None = DEFAULT_BACKGROUND_IMAGE,
-    colored_arrows: bool = True,
+    colored_arrows: bool = False,
+    plot_loads: bool = True,
+    population_heatmap: bool = False,
+    industrial_heatmap: bool = False,
 ) -> Tuple[plt.Figure, plt.Axes]:
     """Plot asset dependencies and optionally overlay geographic locations on a map."""
     dependency_map = _dependency_map()
@@ -537,6 +559,112 @@ def plot_asset_dependency_network(
     edges = list(_edge_list())
     edge_labels = _edge_labels()
     coord_map_full = _asset_coordinate_map()
+    snapshot_full = _network_snapshot()
+
+    def _create_load_figure() -> plt.Figure | None:
+        components_info = snapshot_full["components"].values()
+        compressor_components = [cfg for cfg in components_info if cfg.category == "compressor"]
+        substation_components = [cfg for cfg in components_info if cfg.category == "substation"]
+        if not compressor_components and not substation_components:
+            return None
+
+        fig_load, axes = plt.subplots(1, 2, figsize=(12, 5))
+        if not isinstance(axes, np.ndarray):
+            axes = np.array([axes])
+        axes = axes.reshape(1, -1)
+
+        def _plot_panel(ax: plt.Axes, comps, supply_map, people_map, industrial_map, title: str) -> None:
+            if not comps:
+                ax.axis("off")
+                ax.set_title(f"{title}\n(no data)")
+                return
+            names = [cfg.name for cfg in comps]
+            idx = np.arange(len(names))
+            width = 0.35
+            people_vals = np.array([people_map.get(name, 0.0) for name in names]) / 1e3
+            industrial_vals = np.array([industrial_map.get(name, 0.0) for name in names]) / 1e3
+            supply_vals = np.array([supply_map.get(name, 0.0) for name in names])
+            ax.bar(idx - width / 2, people_vals, width=width, label="Population (×10³)", color="#74add1")
+            ax.bar(idx + width / 2, industrial_vals, width=width, label="Industrial (×10³)", color="#fdae61")
+            for i, supply in enumerate(supply_vals):
+                ax.text(idx[i], max(people_vals[i], industrial_vals[i]) + 0.05, f"{supply:.0f} MW", ha="center", va="bottom", fontsize=8)
+            ax.set_xticks(idx)
+            ax.set_xticklabels(names, rotation=45, ha="right")
+            ax.set_ylabel("Weighted load (thousands)")
+            ax.set_title(title)
+            ax.legend(fontsize=8)
+
+        _plot_panel(
+            axes[0, 0],
+            compressor_components,
+            snapshot_full.get("compressor_supply", {}),
+            snapshot_full.get("compressor_people", {}),
+            snapshot_full.get("compressor_industrial", {}),
+            "Compressor loads",
+        )
+        _plot_panel(
+            axes[0, 1],
+            substation_components,
+            snapshot_full.get("substation_supply", {}),
+            snapshot_full.get("substation_people", {}),
+            snapshot_full.get("substation_industrial", {}),
+            "Substation loads",
+        )
+        fig_load.tight_layout()
+        return fig_load
+
+    def _create_heatmap_figure(weight_attr: str, title: str, cmap: str) -> plt.Figure | None:
+        coords = []
+        weights = []
+        for name, cfg in snapshot_full["components"].items():
+            if cfg.category not in {"compressor", "substation"}:
+                continue
+            coord = coord_map_full.get(name)
+            if coord is None:
+                continue
+            weight = getattr(cfg, weight_attr, 0.0)
+            if not weight:
+                continue
+            coords.append(coord)
+            weights.append(float(weight))
+        if not coords:
+            return None
+        extent = _map_extent(coord_map_full)
+        xmin, xmax, ymin, ymax = extent
+        xs = np.array([c[0] for c in coords])
+        ys = np.array([c[1] for c in coords])
+        fig_heat, ax_heat = plt.subplots(figsize=(10, 10))
+        hb = ax_heat.hexbin(
+            xs,
+            ys,
+            C=np.array(weights, dtype=np.float64),
+            gridsize=40,
+            extent=extent,
+            cmap=cmap,
+            reduce_C_function=np.sum,
+            mincnt=1,
+            linewidths=0.0,
+            alpha=0.85,
+        )
+        ax_heat.set_xlim(xmin, xmax)
+        ax_heat.set_ylim(ymin, ymax)
+        ax_heat.set_xlabel("Easting [m]")
+        ax_heat.set_ylabel("Northing [m]")
+        ax_heat.set_title(title)
+        fig_heat.colorbar(hb, ax=ax_heat, label="Weighted density")
+        _draw_geographic_network(
+            ax_heat,
+            nodes,
+            edges,
+            edge_labels,
+            coord_map_full,
+            colored_arrows=colored_arrows,
+            edge_linewidth=1.0,
+            edge_color="#2b2b2b",
+            edge_alpha=0.6,
+        )
+        fig_heat.tight_layout()
+        return fig_heat
 
     secondary_fig: plt.Figure | None = None
 
@@ -547,6 +675,11 @@ def plot_asset_dependency_network(
             fig, ax = plt.subplots(figsize=(12, 8))
     else:
         fig = ax.figure
+
+    secondary_fig: plt.Figure | None = None
+    load_fig: plt.Figure | None = None
+    population_fig: plt.Figure | None = None
+    industrial_fig: plt.Figure | None = None
 
     if include_map:
         relevant_coords = {node: coord_map_full[node] for node in nodes if node in coord_map_full}
@@ -565,6 +698,12 @@ def plot_asset_dependency_network(
             cbar.ax.tick_params(labelsize=9)
 
         coord_map = coord_map_full
+        if plot_loads:
+            load_fig = _create_load_figure()
+        if population_heatmap:
+            population_fig = _create_heatmap_figure("population", "Population density", "YlGnBu")
+        if industrial_heatmap:
+            industrial_fig = _create_heatmap_figure("industrial_load", "Industrial load density", "YlOrRd")
         legend_handles = _draw_geographic_network(
             ax,
             nodes,
@@ -633,6 +772,12 @@ def plot_asset_dependency_network(
         ax.margins(0.2)
         if subplot_title:
             ax.set_title(subplot_title, fontsize=13)
+        if plot_loads:
+            load_fig = _create_load_figure()
+        if population_heatmap:
+            population_fig = _create_heatmap_figure("population", "Population density", "YlGnBu")
+        if industrial_heatmap:
+            industrial_fig = _create_heatmap_figure("industrial_load", "Industrial load density", "YlOrRd")
 
         for start, end in edges:
             x0, y0 = positions[start]
@@ -724,6 +869,18 @@ def plot_asset_dependency_network(
         fig._secondary_map_figure = secondary_fig
         if secondary_fig is not None:
             secondary_fig._primary_map_figure = fig
+    if plot_loads:
+        fig._load_distribution_figure = load_fig
+        if load_fig is not None:
+            load_fig._primary_network_figure = fig
+    if population_heatmap:
+        fig._population_heatmap_figure = population_fig
+        if population_fig is not None:
+            population_fig._primary_network_figure = fig
+    if industrial_heatmap:
+        fig._industrial_heatmap_figure = industrial_fig
+        if industrial_fig is not None:
+            industrial_fig._primary_network_figure = fig
     if save_path is not None:
         save_path_obj = Path(save_path)
     else:
@@ -744,10 +901,33 @@ def plot_asset_dependency_network(
         else:
             secondary_path = Path(f"{primary_path}_image")
         secondary_fig.savefig(secondary_path, bbox_inches="tight")
+    if plot_loads and load_fig is not None:
+        if primary_path.suffix:
+            loads_path = primary_path.with_name(f"{primary_path.stem}_loads{primary_path.suffix}")
+        else:
+            loads_path = Path(f"{primary_path}_loads")
+        load_fig.savefig(loads_path, bbox_inches="tight")
+    if population_heatmap and population_fig is not None:
+        if primary_path.suffix:
+            pop_path = primary_path.with_name(f"{primary_path.stem}_population{primary_path.suffix}")
+        else:
+            pop_path = Path(f"{primary_path}_population")
+        population_fig.savefig(pop_path, bbox_inches="tight")
+    if industrial_heatmap and industrial_fig is not None:
+        if primary_path.suffix:
+            ind_path = primary_path.with_name(f"{primary_path.stem}_industrial{primary_path.suffix}")
+        else:
+            ind_path = Path(f"{primary_path}_industrial")
+        industrial_fig.savefig(ind_path, bbox_inches="tight")
     if show:
         plt.show()
     return fig, ax
 
 
 if __name__ == "__main__":
-    plot_asset_dependency_network()
+    plot_asset_dependency_network(
+    include_map=True,
+    population_heatmap=False,
+    industrial_heatmap=False,
+    save_path="Images/network.png",
+)
