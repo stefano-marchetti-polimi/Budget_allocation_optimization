@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 from pathlib import Path
 import warnings
 from typing import Iterable, Sequence
@@ -10,12 +11,14 @@ from typing import Iterable, Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import imageio.v3 as iio
 
 from optimization_parallel import TrialEnv, env_kwargs, year_step
 
 TEST_ENV_KWARGS = dict(env_kwargs)
-TEST_ENV_KWARGS["mc_samples"] = 10_000
+TEST_ENV_KWARGS["mc_samples"] = 1000
 from utils.plot_asset_network import (
+    DEFAULT_BACKGROUND_IMAGE,
     DEFAULT_DEM_PATH,
     _network_snapshot,
     _map_extent,
@@ -25,33 +28,30 @@ from utils.plot_asset_network import (
 )
 
 
-def _default_years(horizon: int, step: int, count: int = 4) -> list[int]:
-    """Snap evenly spaced years to the decision grid."""
+def _calendar_year_range(base_year: int, horizon: int, step: int) -> list[int]:
+    """Return calendar years from base_year to base_year + horizon inclusive."""
     if step <= 0:
         step = 1
-    raw = np.linspace(0, float(horizon), num=count, endpoint=True)
-    years: list[int] = []
-    for value in raw:
-        snapped = int(round(value / step)) * step
-        snapped = max(0, min(snapped, horizon))
-        if snapped not in years:
-            years.append(snapped)
-    if len(years) < count:
-        # Backfill with successive steps if rounding collapsed points.
-        candidate = 0
-        while len(years) < count and candidate <= horizon:
-            if candidate not in years:
-                years.append(candidate)
-            candidate += step
-        years.sort()
-    return years
+    end_year = base_year + horizon
+    return list(range(base_year, end_year + 1, step))
 
 
-def _snap_years(years: Iterable[float], horizon: int, step: int) -> list[int]:
+def _snap_calendar_years(
+    years: Iterable[float],
+    *,
+    base_year: int,
+    horizon: int,
+    step: int,
+) -> list[int]:
+    """Snap arbitrary calendar years to the simulation grid."""
+    end_year = base_year + horizon
     snapped: list[int] = []
+    if step <= 0:
+        step = 1
     for value in years:
-        snapped_year = int(round(float(value) / step)) * step
-        snapped_year = max(0, min(snapped_year, horizon))
+        offset = round((float(value) - base_year) / step) * step
+        snapped_year = base_year + int(offset)
+        snapped_year = max(base_year, min(snapped_year, end_year))
         if snapped_year not in snapped:
             snapped.append(snapped_year)
     snapped.sort()
@@ -90,22 +90,26 @@ def _compute_state_payloads(
 
 def _summarise_probabilities(
     env: TrialEnv,
-    years: Sequence[int],
+    env_years: Sequence[int],
     payloads: Sequence[dict[str, dict[str, np.ndarray]]],
+    *,
+    base_year: int = 0,
 ) -> pd.DataFrame:
-    if len(years) != len(payloads):
+    if len(env_years) != len(payloads):
         raise ValueError("Mismatch between requested years and computed payloads.")
     order = {name: idx for idx, name in enumerate(env.component_names)}
     records: list[dict[str, object]] = []
-    for year, state in zip(years, payloads):
+    for env_year, state in zip(env_years, payloads):
         functional = state["functional"]
         availability = state["availability"]
+        calendar_year = base_year + env_year
         for name in env.component_names:
             func = functional[name]
             avail = availability[name]
             records.append(
                 {
-                    "year": year,
+                    "env_year": env_year,
+                    "year": calendar_year,
                     "asset": name,
                     "category": env.component_categories[name],
                     "failure_probability": float(1.0 - func.mean()),
@@ -114,7 +118,7 @@ def _summarise_probabilities(
             )
     df = pd.DataFrame.from_records(records)
     df["asset_order"] = df["asset"].map(order)
-    df = df.sort_values(["year", "asset_order"]).reset_index(drop=True)
+    df = df.sort_values(["env_year", "asset_order"]).reset_index(drop=True)
     return df
 
 
@@ -174,6 +178,7 @@ def _plot_probability_map(
     *,
     cmap: str = "YlOrRd",
     dem_path: Path | None = None,
+    background_image: Path | None = DEFAULT_BACKGROUND_IMAGE,
 ) -> plt.Figure:
     snapshot = _network_snapshot()
     coord_map_full = snapshot["coordinates"]
@@ -182,17 +187,23 @@ def _plot_probability_map(
     edge_labels = _edge_labels()
 
     fig, ax = plt.subplots(figsize=(10, 10))
-    dem_source = dem_path if dem_path is not None else DEFAULT_DEM_PATH
     extent = None
-    if dem_source is not None and dem_source.exists():
-        try:
-            extent, _ = _add_dem_basemap(ax, coord_map_full, dem_path=dem_source)
-        except Exception as exc:
-            warnings.warn(
-                f"DEM basemap unavailable ({exc}); falling back to plain background.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+    dem_source = Path(dem_path) if dem_path is not None else None
+    bg_source = Path(background_image) if background_image is not None else None
+    try:
+        extent, _ = _add_dem_basemap(
+            ax,
+            coord_map_full,
+            dem_path=dem_source,
+            background_image=bg_source,
+        )
+    except Exception as exc:
+        warnings.warn(
+            f"Basemap unavailable ({exc}); falling back to plain background.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        extent = None
     if extent is None:
         xmin, xmax, ymin, ymax = _map_extent(coord_map_full)
         ax.set_xlim(xmin, xmax)
@@ -206,9 +217,13 @@ def _plot_probability_map(
         edges,
         edge_labels,
         coord_map_full,
+        edge_color="#ffffff",
         colored_arrows=False,
         edge_alpha=0.65,
-        edge_linewidth=1.1,
+        edge_linewidth=1.0,
+        label_offset=2300.0,
+        label_fontsize=7.0,
+        node_size=120.0,
     )
 
     year_df = df[df["year"] == year]
@@ -340,8 +355,8 @@ def main() -> None:
     parser.add_argument(
         "--heatmap-max",
         type=float,
-        default=None,
-        help="Upper bound for colour scale (defaults to each heatmap's maximum probability).",
+        default=0.05,
+        help="Upper bound for colour scale (default: 0.1).",
     )
     parser.add_argument(
         "--map-dir",
@@ -357,35 +372,65 @@ def main() -> None:
     parser.add_argument(
         "--map-dem-path",
         type=Path,
-        help="Override DEM file used as basemap for geographic plots.",
+        help="Optional DEM raster to overlay on the geographic plots.",
+    )
+    parser.add_argument(
+        "--map-background",
+        type=Path,
+        help="Optional raster/image background for geographic plots (defaults to the inundation snapshot).",
+    )
+    parser.add_argument(
+        "--base-year",
+        type=int,
+        default=2025,
+        help="Calendar year corresponding to simulation year 0 (default: 2025).",
+    )
+    parser.add_argument(
+        "--gif-path",
+        type=Path,
+        help="Optional path to save an animated GIF of the geographic maps.",
+    )
+    parser.add_argument(
+        "--gif-duration",
+        type=float,
+        default=5,
+        help="Frame duration (seconds) for the animated GIF (default: 1.5).",
     )
     args = parser.parse_args()
 
     horizon = int(TEST_ENV_KWARGS.get("years", 75))
     step = int(TEST_ENV_KWARGS.get("year_step", year_step))
-    if args.years:
-        target_years = _snap_years(args.years, horizon, step)
-    else:
-        target_years = _default_years(horizon, step, count=4)
+    base_year = int(args.base_year)
 
-    if not target_years:
+    if args.years:
+        calendar_years = _snap_calendar_years(
+            args.years,
+            base_year=base_year,
+            horizon=horizon,
+            step=step,
+        )
+    else:
+        calendar_years = _calendar_year_range(base_year, horizon, step)
+
+    if not calendar_years:
         raise ValueError("No valid evaluation years were provided.")
+    env_years = [int(year - base_year) for year in calendar_years]
 
     env = TrialEnv(**TEST_ENV_KWARGS)
     env.reset(seed=args.seed)
     payloads, _ = _compute_state_payloads(
         env,
-        target_years,
+        env_years,
         reuse_samples=not args.no_shared_samples,
     )
     env.close()
 
-    df = _summarise_probabilities(env, target_years, payloads)
+    df = _summarise_probabilities(env, env_years, payloads, base_year=base_year)
     _print_summary(df)
 
     if args.output_csv:
         args.output_csv.parent.mkdir(parents=True, exist_ok=True)
-        df.drop(columns=["asset_order"]).to_csv(args.output_csv, index=False)
+        df.drop(columns=["asset_order", "env_year"]).to_csv(args.output_csv, index=False)
         print(f"\nSaved results to {args.output_csv}")
 
     figs: list[plt.Figure] = []
@@ -420,7 +465,10 @@ def main() -> None:
     map_requested = args.map_dir is not None or args.show_plots
     if map_requested:
         metric_col, metric_label = _resolve_map_metric(args.map_metric)
-        dem_path = args.map_dem_path if args.map_dem_path is not None else DEFAULT_DEM_PATH
+        dem_path = Path(args.map_dem_path) if args.map_dem_path is not None else None
+        background_image = (
+            Path(args.map_background) if args.map_background is not None else DEFAULT_BACKGROUND_IMAGE
+        )
         if args.heatmap_max is not None:
             map_vmax = float(args.heatmap_max)
         else:
@@ -431,24 +479,48 @@ def main() -> None:
                 map_vmax = float(np.nanmax(metric_array))
                 if map_vmax <= 0.0:
                     map_vmax = 1e-3
-        for year in target_years:
+        gif_frames: list[np.ndarray] = []
+        for calendar_year in calendar_years:
             map_path = (
-                args.map_dir / f"{metric_col}_map_year_{int(year)}.png"
+                args.map_dir / f"{metric_col}_map_year_{int(calendar_year)}.png"
                 if args.map_dir
                 else None
             )
-            figs.append(
-                _plot_probability_map(
-                    df,
-                    int(year),
-                    metric_col,
-                    metric_label,
-                    map_path,
-                    vmax=map_vmax,
-                    cmap="YlOrRd",
-                    dem_path=dem_path if dem_path is not None else None,
-                )
+            fig_map = _plot_probability_map(
+                df,
+                int(calendar_year),
+                metric_col,
+                metric_label,
+                map_path,
+                vmax=map_vmax,
+                cmap="YlOrRd",
+                dem_path=None if background_image is not None else dem_path,
+                background_image=background_image,
             )
+            figs.append(fig_map)
+            buf = io.BytesIO()
+            fig_map.savefig(buf, format="png", dpi=160, bbox_inches="tight")
+            buf.seek(0)
+            gif_frames.append(iio.imread(buf.getvalue()))
+
+        if gif_frames:
+            if args.gif_path is not None:
+                gif_path = args.gif_path
+            elif args.map_dir is not None:
+                gif_path = args.map_dir / f"{metric_col}_transition.gif"
+            else:
+                gif_path = Path("outputs") / f"{metric_col}_transition.gif"
+            gif_path.parent.mkdir(parents=True, exist_ok=True)
+            duration = max(0.05, float(args.gif_duration))
+            frame_count = len(gif_frames)
+            durations = [duration] * frame_count
+            iio.imwrite(
+                gif_path,
+                gif_frames,
+                loop=0,
+                duration=durations,
+            )
+            print(f"\nSaved animation to {gif_path}")
 
     if args.show_plots and figs:
         plt.show()

@@ -214,13 +214,33 @@ def _add_dem_basemap(
     coord_map: Mapping[str, Tuple[float, float]],
     *,
     dem_path: Path | None = DEFAULT_DEM_PATH,
+    background_image: Path | None = DEFAULT_BACKGROUND_IMAGE,
 ) -> Tuple[Tuple[float, float, float, float], plt.AxesImage | None]:
-    """Add a DEM background plus satellite imagery to mirror the c_hand example."""
+    """Draw the requested background (image and/or DEM) and frame the axes."""
     extent = _map_extent(coord_map)
     xmin, xmax, ymin, ymax = extent
     crs_to_use = ASSET_COORD_CRS
     dem_image: plt.AxesImage | None = None
+    background_drawn = False
 
+    if background_image is not None:
+        try:
+            img = mpimg.imread(background_image)
+            if img.ndim == 3 and img.shape[-1] == 4:
+                alpha = img[..., 3]
+                if np.all(alpha <= 1e-6):
+                    img = img[..., :3]
+                else:
+                    rgb = img[..., :3]
+                    img = rgb * alpha[..., None] + (1.0 - alpha[..., None])
+            ax.imshow(img, extent=extent, zorder=0)
+            background_drawn = True
+        except Exception as exc:
+            warnings.warn(
+                f"Failed to load background image {background_image} ({exc}).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     if dem_path is not None:
         try:
             dem, profile = _load_dem(dem_path)
@@ -250,7 +270,7 @@ def _add_dem_basemap(
                 RuntimeWarning,
                 stacklevel=2,
             )
-    if cx is not None:
+    if not background_drawn and cx is not None:
         try:
             cx.add_basemap(
                 ax,
@@ -267,7 +287,7 @@ def _add_dem_basemap(
                 stacklevel=2,
             )
             ax.set_facecolor("#dcdcdc")
-    else:
+    elif not background_drawn:
         warnings.warn(
             "contextily not available; using DEM-only background.",
             RuntimeWarning,
@@ -314,7 +334,10 @@ def _draw_geographic_network(
     label_text_color: str = "black",
     node_label_color: str = "black",
     colored_arrows: bool = False,
-    arrow_outline_color: str = "#101010",
+    arrow_outline_color: str = "#1f1f1f",
+    label_offset: float = 2000.0,
+    label_fontsize: float = 7.5,
+    node_size: float = 140.0,
 ) -> Dict[str, Line2D]:
     """Draw dependency edges and nodes using real-world coordinates."""
     missing_assets: set[str] = set()
@@ -329,7 +352,7 @@ def _draw_geographic_network(
             if end_coord is None:
                 missing_assets.add(end)
             continue
-        start_color = _asset_color(start)
+        start_color = edge_color
         if colored_arrows:
             arrow_kwargs = dict(
                 arrowstyle="-|>",
@@ -338,7 +361,7 @@ def _draw_geographic_network(
                 shrinkB=10,
                 mutation_scale=12,
                 alpha=edge_alpha,
-                color=start_color,
+                color="#ffffff",
                 joinstyle="miter",
             )
         else:
@@ -394,23 +417,30 @@ def _draw_geographic_network(
         ax.scatter(
             [coord[0]],
             [coord[1]],
-            s=160,
+            s=node_size,
             color=color,
             edgecolors="#0f0f0f",
             linewidths=1.1,
             zorder=4,
         )
-        label_x, label_y = coord
-        if node == "Compressor1":
-            label_y += 2500.0
+
+        if label_offset > 0.0:
+            angle = (abs(hash(node)) % 3600) / 3600.0 * 2.0 * math.pi
+            dx = label_offset * math.cos(angle)
+            dy = label_offset * math.sin(angle)
+        else:
+            dx = dy = 0.0
+        ha = "left" if dx >= 0 else "right"
+        va = "bottom" if dy >= 0 else "top"
         text = ax.text(
-            label_x,
-            label_y,
+            coord[0] + dx,
+            coord[1] + dy,
             node,
-            fontsize=9,
-            ha="left",
-            va="bottom",
+            fontsize=label_fontsize,
+            ha=ha,
+            va=va,
             color=node_label_color,
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.78, linewidth=0.0),
             zorder=5,
         )
         text.set_path_effects([patheffects.withStroke(linewidth=2.6, foreground="white")])

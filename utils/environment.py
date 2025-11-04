@@ -59,6 +59,7 @@ class ComponentConfig:
     upgradable: bool = True
     can_fail: bool = True
     industrial_load: float = 0.0
+    residential_load: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,8 @@ class NetworkConfig:
     substation_people: Dict[str, float]
     compressor_industrial: Dict[str, float]
     substation_industrial: Dict[str, float]
+    compressor_residential: Dict[str, float]
+    substation_residential: Dict[str, float]
 
 
 def _format_component_name(raw: str) -> str:
@@ -195,7 +198,7 @@ def _estimate_area(category: str, capacity: float = 0.0, population: float = 0.0
 def _build_default_network(data_dir: Path) -> NetworkConfig:
     data_dir = Path(data_dir)
     asset_path = data_dir / "Assets Catalog filtered.xlsx"
-    population_path = data_dir / "County Population.xlsx"
+    population_path = data_dir / "County_Population_ver2.xlsx"
 
     electric_rows = _read_excel_sheet(asset_path, "Electric Network")
     gas_rows = _read_excel_sheet(asset_path, "Gas Network")
@@ -218,30 +221,34 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         gas_map[_format_component_name(name)] = row
 
     population_map: Dict[str, float] = {}
+    industrial_population_map: Dict[str, float] = {}
+    residential_population_map: Dict[str, float] = {}
     for row in population_rows:
         county = row.get("County")
         pop = row.get("Population Size")
         if not county or not isinstance(pop, (int, float)):
             continue
-        population_map[_format_component_name(county)] = float(pop)
+        key = _format_component_name(county)
+        total_pop = float(pop)
+        population_map[key] = total_pop
 
-    industrial_intensity_base = {
-        "Harris": 1.0,
-        "Jefferson": 0.85,
-        "Orange": 0.75,
-        "Brazoria": 0.7,
-        "Galveston": 0.6,
-        "Chambers": 0.65,
-        "Liberty": 0.4,
-        "Hardin": 0.35,
-        "Fort Bend": 0.45,
-        "Brazos": 0.35,
-    }
-    intensity_default = 0.3
-    industrial_intensity = {
-        _format_component_name(name): float(value)
-        for name, value in industrial_intensity_base.items()
-    }
+        def _fraction(value: object) -> float:
+            if value in (None, "", "NA"):
+                return 0.0
+            try:
+                frac = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Invalid fraction value '{value}' for county '{county}' in {population_path.name}"
+                )
+            if not np.isfinite(frac):
+                return 0.0
+            return float(np.clip(frac, 0.0, 1.0))
+
+        industrial_share = _fraction(row.get("Industrial (%)"))
+        residential_share = _fraction(row.get("Residential (%)"))
+        industrial_population_map[key] = total_pop * industrial_share
+        residential_population_map[key] = total_pop * residential_share
 
     def _row_coordinate(row: Mapping[str, object]) -> Tuple[float, float]:
         east = row.get("Easting (m)")
@@ -289,7 +296,7 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         ComponentConfig(
             name="Calcasieu_Pass_LNG",
             category="lng",
-            hazard_key="P8",
+            hazard_key="Calcasieu_Pass_LNG",
             area=_estimate_area("lng", lng_capacity),
             capacity=lng_capacity,
             coordinate=lng_coord,
@@ -300,23 +307,28 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
 
     # Renewable and non-gas generation units
     generation_defs = [
-        {"name": "Roy_S_Nelson_Coal", "source": ("electric", "Roy_S_Nelson"), "category": "thermal", "hazard": "P7", "dependencies": ()},
-        {"name": "Cottonwood_Bayou_Solar", "source": ("electric", "Cottonwood_Bayou"), "category": "renewable", "hazard": "P1"},
-        {"name": "Galveston_1_Wind", "source": ("electric", "Galveston_1"), "category": "renewable", "hazard": "P1"},
-        {"name": "Galveston_2_Wind", "source": ("electric", "Galveston_2"), "category": "renewable", "hazard": "P1"},
-        {"name": "Lake_Charles_Wind", "source": ("electric", "Lake_Charles"), "category": "renewable", "hazard": "P1"},
+        {"name": "Roy_S_Nelson_Coal", "source": ("electric", "Roy_S_Nelson"), "category": "thermal", "dependencies": ()},
+        {"name": "Cottonwood_Bayou_Solar", "source": ("electric", "Cottonwood_Bayou"), "category": "renewable"},
+        {"name": "Galveston_1_Wind", "source": ("electric", "Galveston_1"), "category": "renewable"},
+        {"name": "Galveston_2_Wind", "source": ("electric", "Galveston_2"), "category": "renewable"},
+        {"name": "Lake_Charles_Wind", "source": ("electric", "Lake_Charles"), "category": "renewable"},
+        {"name": "Liberty_1_Solar", "source": ("electric", "Liberty_1"), "category": "renewable"},
+        {"name": "Trinity_River_Solar", "source": ("electric", "Trinity_river_solar"), "category": "renewable"},
+        {"name": "Myrtle_Solar", "source": ("electric", "Myrtle_solar"), "category": "renewable"},
+        {"name": "Red_Bluff_Road_Solar", "source": ("electric", "Red_Bluff_Road_Solar"), "category": "renewable"},
+        {"name": "Brazoria_West_Solar", "source": ("electric", "Brazoria_West"), "category": "renewable"},
     ]
 
     thermal_defs = [
-        {"name": "Sabine_CCGT", "source": ("gas", "Sabine"), "category": "thermal", "hazard": "P7", "dependencies": ("Comp_Sabine",)},
-        {"name": "Port_Arthur_CCGT", "source": ("gas", "Porth_Arthur"), "category": "thermal", "hazard": "P7", "dependencies": ("Comp_Sabine",)},
-        {"name": "Lake_Charles_CCGT", "source": ("gas", "Lake_Charles"), "category": "thermal", "hazard": "P7", "dependencies": ("Comp_Calcasieu",)},
-        {"name": "Cottonwood_Gas", "source": ("gas", "Cottonwood"), "category": "thermal", "hazard": "P7", "dependencies": ("Comp_Calcasieu",)},
-        {"name": "Cedar_Bayou_CCGT", "source": ("gas", "Cedar_Bayou"), "category": "thermal", "hazard": "P7", "dependencies": ("Comp_CedarBayou",)},
-        {"name": "Channelview_CCGT", "source": ("gas", "Channelview"), "category": "thermal", "hazard": "P7", "dependencies": ("Comp_CedarBayou",)},
-        {"name": "Bacliff_CCGT", "source": ("gas", "Bacliff"), "category": "thermal", "hazard": "P7", "dependencies": ("Comp_Freeport",)},
-        {"name": "Galveston_CCGT", "source": ("gas", "Galveston"), "category": "thermal", "hazard": "P7", "dependencies": ("Comp_Freeport",)},
-        {"name": "Freeport_CCGT", "source": ("gas", "Free_Port"), "category": "thermal", "hazard": "P7", "dependencies": ("Comp_Freeport",)},
+        {"name": "Sabine_CCGT", "source": ("gas", "Sabine"), "category": "thermal", "dependencies": ("Comp_Sabine",)},
+        {"name": "Port_Arthur_CCGT", "source": ("gas", "Porth_Arthur"), "category": "thermal", "dependencies": ("Comp_Sabine",)},
+        {"name": "Lake_Charles_CCGT", "source": ("gas", "Lake_Charles"), "category": "thermal", "dependencies": ("Comp_Calcasieu",)},
+        {"name": "Cottonwood_Gas", "source": ("gas", "Cottonwood"), "category": "thermal", "dependencies": ("Comp_Calcasieu",)},
+        {"name": "Cedar_Bayou_CCGT", "source": ("gas", "Cedar_Bayou"), "category": "thermal", "dependencies": ("Comp_CedarBayou",)},
+        {"name": "Channelview_CCGT", "source": ("gas", "Channelview"), "category": "thermal", "dependencies": ("Comp_CedarBayou",)},
+        {"name": "Bacliff_CCGT", "source": ("gas", "Bacliff"), "category": "thermal", "dependencies": ("Comp_Freeport",)},
+        {"name": "Galveston_CCGT", "source": ("gas", "Galveston"), "category": "thermal", "dependencies": ("Comp_Freeport",)},
+        {"name": "Freeport_CCGT", "source": ("gas", "Free_Port"), "category": "thermal", "dependencies": ("Comp_Freeport",)},
     ]
 
     offshore_wind_assets = {"Galveston_1_Wind", "Galveston_2_Wind", "Lake_Charles_Wind"}
@@ -335,7 +347,7 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
             ComponentConfig(
                 name=spec["name"],
                 category=spec["category"],
-                hazard_key=spec.get("hazard", "P7"),
+                hazard_key=spec["name"],
                 area=area,
                 dependencies=tuple(spec.get("dependencies", ())),
                 capacity=capacity,
@@ -362,14 +374,15 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
     }
 
     # Compressor stations (dependencies handled later)
-    compressor_defs = {
-        "Comp_Sabine": ("P4", ("Calcasieu_Pass_LNG",)),
-        "Comp_Calcasieu": ("P5", ("Calcasieu_Pass_LNG",)),
-        "Comp_CedarBayou": ("P6", ("Calcasieu_Pass_LNG",)),
-        "Comp_Freeport": ("P5", ("Calcasieu_Pass_LNG",)),
+    compressor_dependencies = {
+        "Comp_Sabine": ("Calcasieu_Pass_LNG",),
+        "Comp_Calcasieu": ("Calcasieu_Pass_LNG",),
+        "Comp_CedarBayou": ("Calcasieu_Pass_LNG",),
+        "Comp_Freeport": ("Calcasieu_Pass_LNG",),
     }
     compressor_industrial_load: Dict[str, float] = {}
-    for name, (hazard, deps) in compressor_defs.items():
+    compressor_residential_load: Dict[str, float] = {}
+    for name, deps in compressor_dependencies.items():
         feed_assets = compressor_feeds.get(name, ())
         supply_capacity = sum(capacity_map.get(asset, 0.0) for asset in feed_assets)
         centroid = _weighted_centroid(feed_assets)
@@ -377,16 +390,18 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
             centroid = coordinate_map.get("Calcasieu_Pass_LNG")
         counties = compressor_counties.get(name, ())
         industrial_load = 0.0
+        residential_load = 0.0
         for county in counties:
             key = _format_component_name(county)
-            intensity = industrial_intensity.get(key, intensity_default)
-            industrial_load += population_map.get(key, 0.0) * intensity
+            industrial_load += industrial_population_map.get(key, 0.0)
+            residential_load += residential_population_map.get(key, 0.0)
         compressor_industrial_load[name] = industrial_load
+        compressor_residential_load[name] = residential_load
         components.append(
             ComponentConfig(
                 name=name,
                 category="compressor",
-                hazard_key=hazard,
+                hazard_key=name,
                 area=_estimate_area("compressor", supply_capacity),
                 dependencies=tuple(deps),
                 capacity=supply_capacity,
@@ -394,6 +409,7 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
                 upgradable=True,
                 can_fail=True,
                 industrial_load=industrial_load,
+                residential_load=residential_load,
             )
         )
         if centroid is not None:
@@ -401,21 +417,12 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         capacity_map[name] = supply_capacity
 
     substation_generators: Dict[str, Tuple[str, ...]] = {
-        "Sub_Harris_ShipChannel": ("Channelview_CCGT", "Cedar_Bayou_CCGT", "Galveston_1_Wind", "Galveston_2_Wind"),
-        "Sub_FortBend_Expansion": ("Freeport_CCGT", "Cottonwood_Bayou_Solar"),
+        "Sub_Harris_ShipChannel": ("Channelview_CCGT", "Cedar_Bayou_CCGT", "Galveston_1_Wind", "Galveston_2_Wind", "Red_Bluff_Road_Solar"),
+        "Sub_FortBend_Expansion": ("Freeport_CCGT", "Cottonwood_Bayou_Solar", "Myrtle_Solar"),
         "Sub_Galveston_Island": ("Galveston_1_Wind", "Galveston_2_Wind", "Galveston_CCGT", "Bacliff_CCGT"),
-        "Sub_Brazoria_Gulf": ("Freeport_CCGT", "Cottonwood_Bayou_Solar", "Bacliff_CCGT"),
+        "Sub_Brazoria_Gulf": ("Freeport_CCGT", "Cottonwood_Bayou_Solar", "Bacliff_CCGT", "Brazoria_West_Solar"),
         "Sub_Jefferson_Orange": ("Roy_S_Nelson_Coal", "Sabine_CCGT", "Port_Arthur_CCGT", "Lake_Charles_Wind", "Lake_Charles_CCGT"),
-        "Sub_Liberty_Chambers": ("Cedar_Bayou_CCGT", "Channelview_CCGT", "Cottonwood_Gas"),
-    }
-
-    substation_hazards = {
-        "Sub_Harris_ShipChannel": "P2",
-        "Sub_FortBend_Expansion": "P2",
-        "Sub_Galveston_Island": "P3",
-        "Sub_Brazoria_Gulf": "P2",
-        "Sub_Jefferson_Orange": "P3",
-        "Sub_Liberty_Chambers": "P2",
+        "Sub_Liberty_Chambers": ("Cedar_Bayou_CCGT", "Channelview_CCGT", "Cottonwood_Gas", "Liberty_1_Solar", "Trinity_River_Solar"),
     }
 
     substation_counties = {
@@ -433,6 +440,7 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         substation_people[name] = total
 
     substation_industrial_load: Dict[str, float] = {}
+    substation_residential_load: Dict[str, float] = {}
     for name, generators in substation_generators.items():
         capacity = sum(capacity_map.get(gen, 0.0) for gen in generators)
         population = substation_people.get(name, 0.0)
@@ -441,22 +449,25 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
             centroid = coordinate_map.get("Calcasieu_Pass_LNG")
         counties = substation_counties.get(name, ())
         industrial_load = 0.0
+        residential_load = 0.0
         for county in counties:
             key = _format_component_name(county)
-            intensity = industrial_intensity.get(key, intensity_default)
-            industrial_load += population_map.get(key, 0.0) * intensity
+            industrial_load += industrial_population_map.get(key, 0.0)
+            residential_load += residential_population_map.get(key, 0.0)
         substation_industrial_load[name] = industrial_load
+        substation_residential_load[name] = residential_load
         components.append(
             ComponentConfig(
                 name=name,
                 category="substation",
-                hazard_key=substation_hazards.get(name, "P2"),
+                hazard_key=name,
                 area=_estimate_area("substation", capacity, population),
                 generator_sources=generators,
                 population=population,
                 capacity=capacity,
                 coordinate=centroid,
                 industrial_load=industrial_load,
+                residential_load=residential_load,
             )
         )
         if centroid is not None:
@@ -481,6 +492,8 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         substation_people=substation_people,
         compressor_industrial=compressor_industrial_load,
         substation_industrial=substation_industrial_load,
+        compressor_residential=compressor_residential_load,
+        substation_residential=substation_residential_load,
     )
 
 class TrialEnv(gym.Env):
@@ -748,6 +761,16 @@ class TrialEnv(gym.Env):
             network_config.substation_industrial,
             "substation industrial",
         )
+        self.compressor_residential = _array_from_mapping(
+            self.compressor_order,
+            network_config.compressor_residential,
+            "compressor residential",
+        )
+        self.substation_residential = _array_from_mapping(
+            self.substation_order,
+            network_config.substation_residential,
+            "substation residential",
+        )
 
         self.compressor_names = list(self.compressor_order)
         self.substation_names = list(self.substation_order)
@@ -764,6 +787,8 @@ class TrialEnv(gym.Env):
         self.total_power_people = float(self.substation_people.sum())
         self.total_gas_industrial = float(self.compressor_industrial.sum())
         self.total_power_industrial = float(self.substation_industrial.sum())
+        self.total_gas_residential = float(self.compressor_residential.sum())
+        self.total_power_residential = float(self.substation_residential.sum())
 
         if self.total_gas_supply > 0.0:
             self.compressor_supply_fraction = (self.compressor_gas_supply / self.total_gas_supply).astype(np.float32)
@@ -794,6 +819,16 @@ class TrialEnv(gym.Env):
             self.substation_industrial_fraction = (self.substation_industrial / self.total_power_industrial).astype(np.float32)
         else:
             self.substation_industrial_fraction = np.zeros_like(self.substation_industrial, dtype=np.float32)
+
+        if self.total_gas_residential > 0.0:
+            self.compressor_residential_fraction = (self.compressor_residential / self.total_gas_residential).astype(np.float32)
+        else:
+            self.compressor_residential_fraction = np.zeros_like(self.compressor_residential, dtype=np.float32)
+
+        if self.total_power_residential > 0.0:
+            self.substation_residential_fraction = (self.substation_residential / self.total_power_residential).astype(np.float32)
+        else:
+            self.substation_residential_fraction = np.zeros_like(self.substation_residential, dtype=np.float32)
 
         if initial_wall_height is None:
             self.initial_wall_height = np.zeros(self.N, dtype=np.float32)
@@ -1005,6 +1040,7 @@ class TrialEnv(gym.Env):
         *,
         return_cache: bool = False,
         return_details: bool = False,
+        return_states: bool = False,
     ):
         if self._base_heights is None or self._base_durations is None:
             self._generate_hazard_samples()
@@ -1125,7 +1161,7 @@ class TrialEnv(gym.Env):
             (1.0 - self.industrial_weight) * gas_supply_loss_samples
             + self.industrial_weight * gas_industrial_loss_samples
         )
-        gas_social_fraction = gas_unavailable * self.compressor_people_fraction[:, None]
+        gas_social_fraction = gas_unavailable * self.compressor_residential_fraction[:, None]
         gas_social_samples = (gas_social_fraction * gas_time_ratio).sum(axis=0)
 
         power_services = np.stack([availability[name] for name in self.substation_order])
@@ -1140,7 +1176,7 @@ class TrialEnv(gym.Env):
             (1.0 - self.industrial_weight) * power_supply_loss_samples
             + self.industrial_weight * power_industrial_loss_samples
         )
-        power_social_fraction = power_unavailable * self.substation_people_fraction[:, None]
+        power_social_fraction = power_unavailable * self.substation_residential_fraction[:, None]
         electricity_social_samples = (power_social_fraction * power_time_ratio).sum(axis=0)
 
         gas_supply_mean = float(gas_supply_loss_samples.mean())
@@ -1163,6 +1199,13 @@ class TrialEnv(gym.Env):
             "elec_social_mean": elec_social_mean,
         }
 
+        state_payload = None
+        if return_states:
+            state_payload = {
+                "functional": {name: functional[name].copy() for name in self.component_names},
+                "availability": {name: availability[name].copy() for name in self.component_names},
+            }
+
         depth_means = {
             name: float(depth_samples[name].mean() + offset)
             for name in self.component_names
@@ -1182,13 +1225,16 @@ class TrialEnv(gym.Env):
             gas_social_mean,
             elec_social_mean,
         )
-        if return_cache and return_details:
-            return metrics, cache, (depth_means, depth_p95, depth_max)
+        extras: list = []
         if return_cache:
-            return metrics, cache
+            extras.append(cache)
         if return_details:
-            return metrics, (depth_means, depth_p95, depth_max)
-        return metrics
+            extras.append((depth_means, depth_p95, depth_max))
+        if return_states:
+            extras.append(state_payload)
+        if not extras:
+            return metrics
+        return (metrics, *extras)
 
     def _compute_loss(self, metrics: tuple[float, float, float, float]) -> float:
         gas_loss, elec_loss, gas_social, elec_social = metrics
