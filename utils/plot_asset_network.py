@@ -91,9 +91,11 @@ def _network_snapshot() -> Dict[str, object]:
         "components": components,
         "compressor_people": network.compressor_people,
         "compressor_industrial": network.compressor_industrial,
+        "compressor_residential": network.compressor_residential,
         "compressor_supply": network.compressor_supply,
         "substation_people": network.substation_people,
         "substation_industrial": network.substation_industrial,
+        "substation_residential": network.substation_residential,
         "substation_supply": network.substation_supply,
     }
 
@@ -573,7 +575,7 @@ def plot_asset_dependency_network(
             axes = np.array([axes])
         axes = axes.reshape(1, -1)
 
-        def _plot_panel(ax: plt.Axes, comps, supply_map, people_map, industrial_map, title: str) -> None:
+        def _plot_panel(ax: plt.Axes, comps, supply_map, residential_map, industrial_map, title: str) -> None:
             if not comps:
                 ax.axis("off")
                 ax.set_title(f"{title}\n(no data)")
@@ -581,13 +583,20 @@ def plot_asset_dependency_network(
             names = [cfg.name for cfg in comps]
             idx = np.arange(len(names))
             width = 0.35
-            people_vals = np.array([people_map.get(name, 0.0) for name in names]) / 1e3
+            residential_vals = np.array([residential_map.get(name, 0.0) for name in names]) / 1e3
             industrial_vals = np.array([industrial_map.get(name, 0.0) for name in names]) / 1e3
             supply_vals = np.array([supply_map.get(name, 0.0) for name in names])
-            ax.bar(idx - width / 2, people_vals, width=width, label="Population (×10³)", color="#74add1")
+            ax.bar(idx - width / 2, residential_vals, width=width, label="Residential (×10³)", color="#74add1")
             ax.bar(idx + width / 2, industrial_vals, width=width, label="Industrial (×10³)", color="#fdae61")
             for i, supply in enumerate(supply_vals):
-                ax.text(idx[i], max(people_vals[i], industrial_vals[i]) + 0.05, f"{supply:.0f} MW", ha="center", va="bottom", fontsize=8)
+                ax.text(
+                    idx[i],
+                    max(residential_vals[i], industrial_vals[i]) + 0.05,
+                    f"{supply:.0f} MW",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
             ax.set_xticks(idx)
             ax.set_xticklabels(names, rotation=45, ha="right")
             ax.set_ylabel("Weighted load (thousands)")
@@ -598,7 +607,7 @@ def plot_asset_dependency_network(
             axes[0, 0],
             compressor_components,
             snapshot_full.get("compressor_supply", {}),
-            snapshot_full.get("compressor_people", {}),
+            snapshot_full.get("compressor_residential", {}),
             snapshot_full.get("compressor_industrial", {}),
             "Compressor loads",
         )
@@ -606,7 +615,7 @@ def plot_asset_dependency_network(
             axes[0, 1],
             substation_components,
             snapshot_full.get("substation_supply", {}),
-            snapshot_full.get("substation_people", {}),
+            snapshot_full.get("substation_residential", {}),
             snapshot_full.get("substation_industrial", {}),
             "Substation loads",
         )
@@ -678,7 +687,7 @@ def plot_asset_dependency_network(
 
     secondary_fig: plt.Figure | None = None
     load_fig: plt.Figure | None = None
-    population_fig: plt.Figure | None = None
+    residential_fig: plt.Figure | None = None
     industrial_fig: plt.Figure | None = None
 
     if include_map:
@@ -701,7 +710,7 @@ def plot_asset_dependency_network(
         if plot_loads:
             load_fig = _create_load_figure()
         if population_heatmap:
-            population_fig = _create_heatmap_figure("population", "Population density", "YlGnBu")
+            residential_fig = _create_heatmap_figure("residential_load", "Residential load density", "YlGnBu")
         if industrial_heatmap:
             industrial_fig = _create_heatmap_figure("industrial_load", "Industrial load density", "YlOrRd")
         legend_handles = _draw_geographic_network(
@@ -775,7 +784,7 @@ def plot_asset_dependency_network(
         if plot_loads:
             load_fig = _create_load_figure()
         if population_heatmap:
-            population_fig = _create_heatmap_figure("population", "Population density", "YlGnBu")
+            residential_fig = _create_heatmap_figure("residential_load", "Residential load density", "YlGnBu")
         if industrial_heatmap:
             industrial_fig = _create_heatmap_figure("industrial_load", "Industrial load density", "YlOrRd")
 
@@ -874,9 +883,10 @@ def plot_asset_dependency_network(
         if load_fig is not None:
             load_fig._primary_network_figure = fig
     if population_heatmap:
-        fig._population_heatmap_figure = population_fig
-        if population_fig is not None:
-            population_fig._primary_network_figure = fig
+        fig._residential_heatmap_figure = residential_fig
+        fig._population_heatmap_figure = residential_fig
+        if residential_fig is not None:
+            residential_fig._primary_network_figure = fig
     if industrial_heatmap:
         fig._industrial_heatmap_figure = industrial_fig
         if industrial_fig is not None:
@@ -907,12 +917,12 @@ def plot_asset_dependency_network(
         else:
             loads_path = Path(f"{primary_path}_loads")
         load_fig.savefig(loads_path, bbox_inches="tight")
-    if population_heatmap and population_fig is not None:
+    if population_heatmap and residential_fig is not None:
         if primary_path.suffix:
-            pop_path = primary_path.with_name(f"{primary_path.stem}_population{primary_path.suffix}")
+            pop_path = primary_path.with_name(f"{primary_path.stem}_residential{primary_path.suffix}")
         else:
-            pop_path = Path(f"{primary_path}_population")
-        population_fig.savefig(pop_path, bbox_inches="tight")
+            pop_path = Path(f"{primary_path}_residential")
+        residential_fig.savefig(pop_path, bbox_inches="tight")
     if industrial_heatmap and industrial_fig is not None:
         if primary_path.suffix:
             ind_path = primary_path.with_name(f"{primary_path.stem}_industrial{primary_path.suffix}")
