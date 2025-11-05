@@ -36,7 +36,7 @@ EVAL_SEED = 1042
 
 # Deterministic evaluation runs a single greedy episode.
 # Set to False to sample actions; STOCHASTIC_EPISODES controls how many rollouts to average.
-DETERMINISTIC_EVAL = True
+DETERMINISTIC_EVAL = False
 STOCHASTIC_EPISODES = 10
 
 from optimization_parallel import (

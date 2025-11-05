@@ -17,7 +17,7 @@ import gymnasium as gym
 from utils.environment import TrialEnv, _build_default_network  # must be importable at top level
 
 # -------------------- User parameters --------------------
-SCENARIO_NAME = "electricity-social"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social)
+SCENARIO_NAME = "gas-economic"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social)
 CLIMATE_SCENARIO = "SSP5-8.5"  # sea level rise projections (SSP1-1.9, SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5, All)
 BUDGET = 500000
 MC_SAMPLES = 1000
