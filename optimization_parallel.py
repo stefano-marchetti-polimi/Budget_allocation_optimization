@@ -17,7 +17,7 @@ import gymnasium as gym
 from utils.environment import TrialEnv, _build_default_network  # must be importable at top level
 
 # -------------------- User parameters --------------------
-SCENARIO_NAME = "gas-economic"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social)
+SCENARIO_NAME = "electricity-economic"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social)
 CLIMATE_SCENARIO = "SSP5-8.5"  # sea level rise projections (SSP1-1.9, SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5, All)
 BUDGET = 500000
 MC_SAMPLES = 1000
@@ -27,7 +27,7 @@ _NETWORK_CONFIG = _build_default_network(PROJECT_ROOT / "data")
 num_nodes = len(_NETWORK_CONFIG.components)
 years = 75 # until 2100
 year_step = 5 # 15 decisions
-RL_steps = 5000000*4
+RL_steps = 1000000
 learning_rate = 5e-4
 
 # Per-asset footprint areas (m^2)
@@ -243,10 +243,22 @@ env_kwargs = dict(
     climate_scenario=CLIMATE_SCENARIO,
 )
 
-RESULTS_DIR = "results"
-LOG_DIR = "log"
-os.makedirs(RESULTS_DIR, exist_ok=True)
+def _capitalize_first(text: str) -> str:
+    return text[:1].upper() + text[1:] if text else text
+
+LOG_BASE_DIR = "log"
+scenario_log_name = _capitalize_first(SCENARIO_NAME.replace("_", "-").replace(" ", "-"))
+climate_log_name = CLIMATE_SCENARIO.replace("_", "-").replace(" ", "-")
+LOG_RUN_NAME = f"{scenario_log_name}-{climate_log_name}"
+LOG_DIR = os.path.join(LOG_BASE_DIR, LOG_RUN_NAME)
+
+scenario_results_name = SCENARIO_NAME.replace(" ", "_").replace("-", "_")
+climate_results_name = CLIMATE_SCENARIO.replace(" ", "_")
+RESULTS_DIR = f"results_{scenario_results_name}_{climate_results_name}"
+
 os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
 BEST_MODEL_DIR = os.path.join(RESULTS_DIR, "best_models")
 CHECKPOINT_DIR = os.path.join(RESULTS_DIR, "checkpoints")
 os.makedirs(BEST_MODEL_DIR, exist_ok=True)
@@ -561,7 +573,7 @@ def main():
         max_grad_norm=0.5,
         policy_kwargs=policy_kwargs,
         verbose=1,
-        tensorboard_log="./log",
+        tensorboard_log=LOG_BASE_DIR,
         device=device,
         seed=seed,
     )
@@ -610,7 +622,7 @@ def main():
     )
     callback = CallbackList([entropy_callback, action_callback, info_callback, eval_callback, checkpoint_callback])
 
-    model.learn(total_timesteps=RL_steps, callback=callback)
+    model.learn(total_timesteps=RL_steps, callback=callback, tb_log_name=LOG_RUN_NAME)
     model.save(os.path.join(RESULTS_DIR, "policy"))
     eval_env_vec.close()
 

@@ -27,6 +27,7 @@ import numpy as np
 import rasterio as rio
 from matplotlib import patheffects
 from matplotlib.lines import Line2D
+from rasterio.errors import RasterioIOError
 from rasterio.plot import plotting_extent
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -57,7 +58,7 @@ CATEGORY_COLORS: Mapping[str, str] = {
 
 DEFAULT_CATEGORY_LABEL = "Unclassified"
 DEFAULT_DEM_PATH = REPO_ROOT / "data" / "houston_example_DEM_30m.tif"
-DEFAULT_BACKGROUND_IMAGE = REPO_ROOT / "data" / "inun_zero_depth.png"
+DEFAULT_BACKGROUND_IMAGE = REPO_ROOT / "data" / "houston_example_DEM_30m_coastal_inundation.tif"
 DEFAULT_IMAGE_DIR = REPO_ROOT / "Images"
 DEFAULT_PRIMARY_FILENAME = "asset_dependency_map.png"
 
@@ -97,6 +98,10 @@ def _network_snapshot() -> Dict[str, object]:
         "substation_industrial": network.substation_industrial,
         "substation_residential": network.substation_residential,
         "substation_supply": network.substation_supply,
+        "county_coordinates": network.county_coordinates,
+        "county_population": network.county_population,
+        "asset_counties": network.asset_counties,
+        "county_display_names": network.county_display_names,
     }
 
 
@@ -177,6 +182,22 @@ def _asset_coordinate_map() -> Dict[str, Tuple[float, float]]:
     return dict(snapshot["coordinates"])
 
 
+def _county_coordinate_map() -> Dict[str, Tuple[float, float]]:
+    snapshot = _network_snapshot()
+    return dict(snapshot.get("county_coordinates", {}))
+
+
+def _asset_county_links() -> Dict[str, Tuple[str, ...]]:
+    snapshot = _network_snapshot()
+    return {asset: tuple(counties) for asset, counties in snapshot.get("asset_counties", {}).items()}
+
+
+def _county_display_name(county_key: str) -> str:
+    snapshot = _network_snapshot()
+    display_map: Mapping[str, str] = snapshot.get("county_display_names", {})
+    return display_map.get(county_key, county_key.replace("_", " "))
+
+
 def _map_extent(coords: Mapping[str, Tuple[float, float]]) -> Tuple[float, float, float, float]:
     """Compute a padded map extent that comfortably frames the provided coordinates."""
     if not coords:
@@ -225,16 +246,23 @@ def _add_dem_basemap(
 
     if background_image is not None:
         try:
-            img = mpimg.imread(background_image)
-            if img.ndim == 3 and img.shape[-1] == 4:
-                alpha = img[..., 3]
-                if np.all(alpha <= 1e-6):
-                    img = img[..., :3]
-                else:
-                    rgb = img[..., :3]
-                    img = rgb * alpha[..., None] + (1.0 - alpha[..., None])
-            ax.imshow(img, extent=extent, zorder=0)
+            bg_extent, _, _ = _add_image_background(
+                ax,
+                coord_map,
+                image_path=Path(background_image),
+                cmap=None,
+                alpha=0.95,
+                mask_zero=False,
+            )
+            extent = bg_extent
+            xmin, xmax, ymin, ymax = extent
             background_drawn = True
+        except FileNotFoundError as exc:
+            warnings.warn(
+                f"Background image not found ({exc}).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         except Exception as exc:
             warnings.warn(
                 f"Failed to load background image {background_image} ({exc}).",
@@ -300,23 +328,87 @@ def _add_dem_basemap(
     return extent, dem_image
 
 
+def _load_georeferenced_image(image_path: Path) -> Tuple[np.ndarray, Tuple[float, float, float, float], Dict[str, object]] | None:
+    """Return pixel data and extent if the path references a georeferenced raster."""
+    try:
+        with rio.open(image_path) as dataset:
+            data = dataset.read(out_dtype=np.float32)
+            profile = dataset.profile
+            transform = profile.get("transform")
+            if transform is None:
+                return None
+    except (RasterioIOError, ValueError):
+        return None
+
+    # Move band axis to the end for RGB/A rasters
+    processed: np.ndarray
+    if data.ndim == 3:
+        if data.shape[0] == 1:
+            processed = data[0]
+        elif data.shape[0] in (3, 4):
+            processed = np.moveaxis(data, 0, -1)
+        else:
+            processed = data[0]
+    else:
+        processed = data
+
+    nodata = profile.get("nodata")
+    if nodata is not None:
+        processed = np.where(processed == nodata, np.nan, processed)
+
+    extent = plotting_extent(data[0], transform)
+    return processed, extent, profile
+
+
 def _add_image_background(
     ax: plt.Axes,
     coord_map: Mapping[str, Tuple[float, float]],
     *,
     image_path: Path,
-) -> Tuple[float, float, float, float]:
+    cmap: str | None = None,
+    alpha: float = 0.95,
+    mask_zero: bool = True,
+) -> Tuple[Tuple[float, float, float, float], plt.AxesImage | None, Dict[str, object] | None]:
     """Use a pre-rendered image as the basemap background."""
-    extent = _map_extent(coord_map)
     if not image_path.exists():
         raise FileNotFoundError(f"Background image not found at {image_path}.")
+
+    georas = _load_georeferenced_image(image_path)
+    if georas is not None:
+        image_data, extent, profile = georas
+        xmin, xmax, ymin, ymax = extent
+
+        if mask_zero and image_data.ndim == 2:
+            image_data = image_data.copy()
+            image_data[np.isclose(image_data, 0.0)] = np.nan
+
+        artist = ax.imshow(
+            image_data,
+            extent=extent,
+            zorder=0,
+            cmap=None if image_data.ndim == 3 else (cmap or "viridis"),
+            alpha=alpha,
+        )
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_aspect("equal")
+        return extent, artist, profile
+
+    warnings.warn(
+        f"Background image {image_path} does not contain geospatial metadata; aligning using asset extent."
+        " The overlay may be misaligned. Prefer supplying a GeoTIFF.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+    extent = _map_extent(coord_map)
     img = mpimg.imread(image_path)
     xmin, xmax, ymin, ymax = extent
-    img_artist = ax.imshow(img, extent=extent, zorder=0)
+    artist = ax.imshow(img, extent=extent, zorder=0, alpha=alpha)
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
     ax.set_aspect("equal")
-    return extent, img_artist
+    return extent, artist, None
 
 
 def _draw_geographic_network(
@@ -571,6 +663,112 @@ def _draw_network_overlay(
     return missing_assets
 
 
+def _draw_county_connections(
+    ax: plt.Axes,
+    nodes: Sequence[str],
+    coord_map: Mapping[str, Tuple[float, float]],
+    *,
+    county_positions: Mapping[str, Tuple[float, float]] | None = None,
+    connection_color: str = "#6a51a3",
+    connection_linestyle: str = "-",
+    connection_alpha: float = 0.55,
+    connection_linewidth: float = 1.2,
+    county_marker: str = "s",
+    county_color: str = "#feb24c",
+    county_edgecolor: str = "#6a51a3",
+    county_marker_size: float = 88.0,
+    county_label_fontsize: float = 7.0,
+    county_label_color: str = "#202020",
+    county_label_offset: float = 2400.0,
+) -> Dict[str, Line2D]:
+    """Overlay county centroids and draw connections to served assets."""
+    county_coords = dict(county_positions) if county_positions is not None else _county_coordinate_map()
+    asset_counties = _asset_county_links()
+    connection_color = "#1f1f1f"
+    if not county_coords or not asset_counties:
+        return {}
+
+    counties_to_plot: Dict[str, Tuple[float, float]] = {}
+    for asset in nodes:
+        for county_key in asset_counties.get(asset, ()):  # type: ignore[arg-type]
+            coord = county_coords.get(county_key)
+            if coord is not None:
+                counties_to_plot[county_key] = coord
+
+    if not counties_to_plot:
+        return {}
+
+    # Draw connections before markers so nodes appear on top
+    for asset in nodes:
+        asset_coord = coord_map.get(asset)
+        if asset_coord is None:
+            continue
+        for county_key in asset_counties.get(asset, ()):  # type: ignore[arg-type]
+            county_coord = counties_to_plot.get(county_key)
+            if county_coord is None:
+                continue
+            ax.annotate(
+                "",
+                xy=county_coord,
+                xytext=asset_coord,
+                arrowprops=dict(
+                    arrowstyle="-|>",
+                    color=connection_color,
+                    linewidth=connection_linewidth,
+                    alpha=connection_alpha,
+                    shrinkA=6,
+                    shrinkB=14,
+                    mutation_scale=10,
+                    linestyle=connection_linestyle,
+                ),
+                zorder=2.2,
+            )
+
+    for county_key, coord in counties_to_plot.items():
+        ax.scatter(
+            [coord[0]],
+            [coord[1]],
+            marker=county_marker,
+            s=county_marker_size,
+            color=county_color,
+            edgecolors=county_edgecolor,
+            linewidths=0.9,
+            zorder=3.6,
+        )
+        if county_label_offset > 0.0:
+            angle = (abs(hash((county_key, "county"))) % 3600) / 3600.0 * 2.0 * math.pi
+            dx = county_label_offset * math.cos(angle)
+            dy = county_label_offset * math.sin(angle)
+        else:
+            dx = dy = 0.0
+        ha = "left" if dx >= 0 else "right"
+        va = "bottom" if dy >= 0 else "top"
+        ax.text(
+            coord[0] + dx,
+            coord[1] + dy,
+            _county_display_name(county_key),
+            fontsize=county_label_fontsize,
+            ha=ha,
+            va=va,
+            color=county_label_color,
+            bbox=dict(boxstyle="round,pad=0.18", facecolor="#ffffff", alpha=0.72, linewidth=0.0),
+            zorder=3.8,
+        )
+
+    return {
+        "County": Line2D(
+            [0],
+            [0],
+            marker=county_marker,
+            color="w",
+            markerfacecolor=county_color,
+            markeredgecolor=county_edgecolor,
+            markersize=6,
+            linewidth=0.0,
+        )
+    }
+
+
 def plot_asset_dependency_network(
     *,
     ax: plt.Axes | None = None,
@@ -584,8 +782,30 @@ def plot_asset_dependency_network(
     plot_loads: bool = True,
     population_heatmap: bool = False,
     industrial_heatmap: bool = False,
+    background_cmap: str | None = "Blues",
+    background_alpha: float = 0.9,
+    background_colorbar_label: str | None = "Inundation depth [m]",
+    background_zero_transparent: bool = True,
+    show_counties: bool = True,
 ) -> Tuple[plt.Figure, plt.Axes]:
-    """Plot asset dependencies and optionally overlay geographic locations on a map."""
+    """Plot asset dependencies and optionally overlay geographic locations on a map.
+
+    Parameters
+    ----------
+    background_image:
+        Path to a background raster (GeoTIFF recommended) used for the secondary map figure.
+        Images without geospatial metadata fall back to the asset extent and may appear misaligned.
+    background_cmap:
+        Colormap applied to single-band rasters when rendering ``background_image``.
+    background_alpha:
+        Opacity applied to the background raster.
+    background_colorbar_label:
+        Label for the background colorbar; set to ``None`` to disable.
+    background_zero_transparent:
+        Treat zero-valued pixels in single-band backgrounds as transparent to expose the basemap.
+    show_counties:
+        Draw county centroids and highlight their service connections to substations and compressors.
+    """
     dependency_map = _dependency_map()
     nodes = _collect_assets(dependency_map)
     edges = list(_edge_list())
@@ -722,6 +942,14 @@ def plot_asset_dependency_network(
 
     if include_map:
         relevant_coords = {node: coord_map_full[node] for node in nodes if node in coord_map_full}
+        county_coords_full = _county_coordinate_map()
+        asset_counties = _asset_county_links()
+        if show_counties:
+            for asset in nodes:
+                for county_key in asset_counties.get(asset, ()):  # type: ignore[arg-type]
+                    county_coord = county_coords_full.get(county_key)
+                    if county_coord is not None:
+                        relevant_coords.setdefault(f"county::{county_key}", county_coord)
         if not relevant_coords:
             raise ValueError("No geographic coordinates available for the requested assets.")
         dem_param = Path(dem_path) if dem_path is not None else None
@@ -753,6 +981,15 @@ def plot_asset_dependency_network(
             arrow_outline_color="#101010",
         )
 
+        if show_counties:
+            county_handles = _draw_county_connections(
+                ax,
+                nodes,
+                coord_map,
+            )
+            if county_handles:
+                legend_handles.update(county_handles)
+
         if legend_handles:
             ax.legend(
                 legend_handles.values(),
@@ -765,13 +1002,34 @@ def plot_asset_dependency_network(
             image_param = Path(background_image)
             try:
                 fig_img, ax_img = plt.subplots(figsize=(10, 10))
-                _add_image_background(ax_img, relevant_coords, image_path=image_param)
+                _, img_artist, img_profile = _add_image_background(
+                    ax_img,
+                    relevant_coords,
+                    image_path=image_param,
+                    cmap=background_cmap,
+                    alpha=background_alpha,
+                    mask_zero=background_zero_transparent,
+                )
                 ax_img.set_xlabel("Easting [m]")
                 ax_img.set_ylabel("Northing [m]")
                 if subplot_title:
                     ax_img.set_title(f"{subplot_title} (image background)", fontsize=13)
                 else:
                     ax_img.set_title("Asset Dependency Map (image background)")
+
+                if (
+                    background_colorbar_label
+                    and img_artist is not None
+                    and img_profile is not None
+                    and getattr(img_artist.get_array(), "ndim", 0) == 2
+                ):
+                    fig_img.colorbar(
+                        img_artist,
+                        ax=ax_img,
+                        shrink=0.8,
+                        label=background_colorbar_label,
+                    )
+
                 legend_img = _draw_geographic_network(
                     ax_img,
                     nodes,
@@ -788,10 +1046,20 @@ def plot_asset_dependency_network(
                     colored_arrows=colored_arrows,
                     arrow_outline_color="#f5f5f5",
                 )
-                if legend_img:
+                county_img_handles: Dict[str, Line2D] = {}
+                if show_counties:
+                    county_img_handles = _draw_county_connections(
+                        ax_img,
+                        nodes,
+                        coord_map,
+                    )
+                combined_handles = dict(legend_img)
+                if county_img_handles:
+                    combined_handles.update(county_img_handles)
+                if combined_handles:
                     ax_img.legend(
-                        legend_img.values(),
-                        legend_img.keys(),
+                        combined_handles.values(),
+                        combined_handles.keys(),
                         title="Asset Type",
                         loc="upper left",
                     )
@@ -805,7 +1073,23 @@ def plot_asset_dependency_network(
                 )
                 secondary_fig = None
     else:
-        positions = _compute_positions(nodes, coord_map_full)
+        county_coords_full = _county_coordinate_map()
+        asset_counties = _asset_county_links() if show_counties else {}
+        county_nodes: set[str] = set()
+        if show_counties:
+            for asset in nodes:
+                for county_key in asset_counties.get(asset, ()):  # type: ignore[arg-type]
+                    if county_key in county_coords_full:
+                        county_nodes.add(county_key)
+
+        layout_nodes = list(nodes)
+        layout_coord_map = dict(coord_map_full)
+        if show_counties:
+            for county_key in county_nodes:
+                layout_nodes.append(county_key)
+                layout_coord_map[county_key] = county_coords_full[county_key]
+
+        positions = _compute_positions(layout_nodes, layout_coord_map)
         ax.set_aspect("equal")
         ax.axis("off")
         ax.margins(0.2)
@@ -893,6 +1177,17 @@ def plot_asset_dependency_network(
                     markersize=9,
                     linewidth=0.0,
                 )
+        if show_counties and county_nodes:
+            asset_position_map = {name: positions[name] for name in nodes}
+            county_position_map = {name: positions[name] for name in county_nodes if name in positions}
+            county_handles = _draw_county_connections(
+                ax,
+                nodes,
+                asset_position_map,
+                county_positions=county_position_map,
+            )
+            if county_handles:
+                legend_handles.update(county_handles)
         if legend_handles:
             ax.legend(
                 legend_handles.values(),

@@ -9,7 +9,9 @@ import json
 import math
 import os
 import re
-from typing import Dict, List, Tuple
+from functools import lru_cache
+from itertools import product
+from typing import Callable, Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,6 +23,10 @@ from stable_baselines3 import PPO
 # If False, you can fall back to the latest checkpoint or a manually specified policy path.
 USE_BEST_MODEL = True
 BEST_MODEL_FILENAME = "best_model.zip"
+
+# Optional absolute/relative path to override the training `RESULTS_DIR`.
+# Leave as None to reuse the path from `optimization_parallel.py`.
+RESULTS_DIR_OVERRIDE = "results_gas_economic_SSP5-8.5"
 
 # Set USE_LATEST_CHECKPOINT to True to automatically load the newest checkpoint inside
 # results/checkpoints. Set it to False and provide POLICY_PATH (with or without .zip)
@@ -36,8 +42,11 @@ EVAL_SEED = 1042
 
 # Deterministic evaluation runs a single greedy episode.
 # Set to False to sample actions; STOCHASTIC_EPISODES controls how many rollouts to average.
-DETERMINISTIC_EVAL = False
+DETERMINISTIC_EVAL = True
 STOCHASTIC_EPISODES = 10
+
+# Expert policy configuration: index 1 corresponds to a 0.5 m increment.
+EXPERT_UPGRADE_LEVEL_INDEX = 1
 
 from optimization_parallel import (
     ASSET_NAMES,
@@ -49,6 +58,22 @@ from optimization_parallel import (
     env_kwargs,
     year_step,
 )
+
+BASE_RESULTS_DIR = RESULTS_DIR
+if RESULTS_DIR_OVERRIDE:
+    RESULTS_DIR = os.path.expanduser(RESULTS_DIR_OVERRIDE)
+    CHECKPOINT_DIR = os.path.join(RESULTS_DIR, "checkpoints")
+    BEST_MODEL_DIR = os.path.join(RESULTS_DIR, "best_models")
+
+
+@lru_cache(maxsize=1)
+def _component_category_map() -> Dict[str, str]:
+    """Return a cached mapping from asset name to its category."""
+    env = TrialEnv(**env_kwargs)
+    try:
+        return dict(env.component_categories)
+    finally:
+        env.close()
 
 
 def resolve_model_path(path: str | None) -> str:
@@ -114,11 +139,11 @@ def best_model_path(filename: str | None = None) -> str:
 
 
 def rollout_episode(
-    model: PPO,
+    action_selector: Callable[[TrialEnv, np.ndarray], np.ndarray],
     seed: int,
     *,
-    deterministic: bool,
     episode_idx: int | None = None,
+    episode_label: str = "Episode",
 ) -> Tuple[
     List[np.ndarray],
     List[np.ndarray],
@@ -126,7 +151,7 @@ def rollout_episode(
     List[dict],
     Dict[str, Dict[str, float]],
 ]:
-    """Run one evaluation episode, logging actions and tracking penalties."""
+    """Run one evaluation episode with the provided action selector, tracking penalties."""
     env = TrialEnv(**env_kwargs)
     obs, _ = env.reset(seed=seed)
 
@@ -156,13 +181,19 @@ def rollout_episode(
     step_idx = 0
 
     while not (terminated or truncated):
-        action, _ = model.predict(obs, deterministic=deterministic)
+        action = action_selector(env, obs)
         action_array = np.asarray(action, dtype=np.int64)
+        if action_array.shape != (env.N,):
+            raise ValueError(
+                f"Expected action of shape ({env.N},), received {action_array.shape} from action selector."
+            )
         actions_log.append(action_array)
         obs_log.append(np.asarray(obs))
         obs, reward, terminated, truncated, info = env.step(action)
         current_weights = np.asarray(env.weights, dtype=np.float32).copy()
         info["weights"] = current_weights
+        info["gas_loss_mean"] = float(getattr(env, "gas_loss_mean", np.nan))
+        info["elec_loss_mean"] = float(getattr(env, "elec_loss_mean", np.nan))
         infos_log.append(info)
         rewards_log.append(float(reward))
 
@@ -215,7 +246,13 @@ def rollout_episode(
             penalty_msgs.append(f"trimmed_assets={trimmed}")
 
         current_year = step_idx * year_step
-        episode_prefix = f"Episode {episode_idx:02d} | " if episode_idx is not None else ""
+        if episode_idx is not None:
+            if episode_label:
+                episode_prefix = f"{episode_label} {episode_idx:02d} | "
+            else:
+                episode_prefix = f"{episode_idx:02d} | "
+        else:
+            episode_prefix = f"{episode_label} | " if episode_label else ""
         print(f"{episode_prefix}Step {step_idx:02d} | Year {current_year}")
         print(f"  Actions: {', '.join(action_pairs)}")
         print(f"  Reward: {reward:.3f}")
@@ -233,6 +270,280 @@ def rollout_episode(
 
     env.close()
     return actions_log, obs_log, rewards_log, infos_log, penalty_summary
+
+
+def make_model_action_selector(model: PPO, deterministic: bool) -> Callable[[TrialEnv, np.ndarray], np.ndarray]:
+    """Return a callable that mimics the Stable-Baselines predict interface."""
+
+    def selector(_: TrialEnv, observation: np.ndarray) -> np.ndarray:
+        action, _ = model.predict(observation, deterministic=deterministic)
+        return np.asarray(action, dtype=np.int64)
+
+    return selector
+
+
+def _failure_probabilities_for_year(env: TrialEnv, target_year: float) -> np.ndarray:
+    """Estimate per-asset failure probabilities for the specified simulation year."""
+    rng_state = None
+    if hasattr(env, "rng") and hasattr(env.rng, "bit_generator"):
+        rng_state = env.rng.bit_generator.state
+    try:
+        _, state_payload = env._compute_metrics(
+            env.improvement_height,
+            year=target_year,
+            return_states=True,
+        )
+    finally:
+        if rng_state is not None:
+            env.rng.bit_generator.state = rng_state
+
+    failure_probs = np.zeros(env.N, dtype=np.float32)
+    if not state_payload:
+        return failure_probs
+    functional = state_payload.get("functional")
+    if not functional:
+        return failure_probs
+    for idx, name in enumerate(env.component_names):
+        status = functional[name]
+        failure_probs[idx] = 1.0 - float(np.mean(status))
+    return failure_probs
+
+
+def expert_action_selector(env: TrialEnv, _: np.ndarray) -> np.ndarray:
+    """Allocate upgrades across the three most fragile upgradable assets within the budget."""
+    action = np.zeros(env.N, dtype=np.int64)
+    if env.N == 0 or float(env.budget) <= 0.0:
+        return action
+    if not hasattr(env, "component_upgradable"):
+        return action
+
+    upgradable_mask = env.component_upgradable.astype(bool)
+    last_positive = getattr(env, "_last_positive_mask", None)
+    if last_positive is not None:
+        upgradable_mask &= ~np.asarray(last_positive, dtype=bool)
+    if not np.any(upgradable_mask):
+        return action
+
+    target_year = env._year + env.year_step
+    failure_probs = _failure_probabilities_for_year(env, float(target_year)).astype(np.float32, copy=False)
+    failure_probs[~upgradable_mask] = -np.inf
+
+    sorted_indices = np.argsort(failure_probs)[::-1]
+    candidate_indices = [
+        idx
+        for idx in sorted_indices
+        if upgradable_mask[idx] and np.isfinite(failure_probs[idx]) and failure_probs[idx] > 0.0
+    ][:3]
+    if not candidate_indices:
+        return action
+
+    height_levels = np.asarray(env.height_levels, dtype=np.float32)
+    if height_levels.size <= 1:
+        return action
+    budget = float(env.budget)
+    num_levels = int(height_levels.size)
+
+    per_asset_costs: Dict[int, List[float]] = {}
+    for asset_idx in candidate_indices:
+        level_costs = [0.0] * num_levels
+        for level_idx in range(1, num_levels):
+            deltas = np.zeros(env.N, dtype=np.float32)
+            deltas[asset_idx] = float(height_levels[level_idx])
+            level_costs[level_idx] = float(env._compute_costs(deltas)[asset_idx])
+        per_asset_costs[asset_idx] = level_costs
+
+    best_combo: Tuple[int, ...] | None = None
+    best_key = (-1.0, -1, -1.0)
+    for level_choices in product(range(num_levels), repeat=len(candidate_indices)):
+        total_cost = 0.0
+        upgrades = 0
+        failure_score = 0.0
+        over_budget = False
+        for asset_idx, level_idx in zip(candidate_indices, level_choices):
+            if level_idx <= 0:
+                continue
+            cost = per_asset_costs[asset_idx][level_idx]
+            total_cost += cost
+            if total_cost > budget + 1e-6:
+                over_budget = True
+                break
+            upgrades += 1
+            failure_score += failure_probs[asset_idx] * level_idx
+        if over_budget:
+            continue
+        candidate_key = (total_cost, upgrades, failure_score)
+        if candidate_key > best_key:
+            best_key = candidate_key
+            best_combo = level_choices
+
+    if best_combo is None or best_key[0] <= 0.0:
+        return action
+
+    for asset_idx, level_idx in zip(candidate_indices, best_combo):
+        action[asset_idx] = level_idx
+
+    return action
+
+
+def plot_reward_comparison(
+    learned_df: pd.DataFrame,
+    expert_df: pd.DataFrame,
+    *,
+    output_path: str,
+    multi_episode: bool,
+) -> None:
+    """Plot cumulative rewards for the learned and expert policies."""
+    if learned_df.empty or expert_df.empty:
+        print("Skipping reward comparison plot because one of the datasets is empty.")
+        return
+
+    def cumulative_summary(df: pd.DataFrame) -> pd.DataFrame:
+        ordered = (
+            df.sort_values(["episode", "step_in_episode"])
+            .reset_index(drop=True)
+            .copy()
+        )
+        ordered["cumulative_reward"] = ordered.groupby("episode")["reward"].cumsum()
+        return ordered.groupby("year")["cumulative_reward"].agg(["mean", "std"])
+
+    learned_summary = cumulative_summary(learned_df)
+    expert_summary = cumulative_summary(expert_df)
+
+    all_years = sorted(set(learned_summary.index).union(expert_summary.index))
+    if not all_years:
+        print("No overlapping years found; skipping reward comparison plot.")
+        return
+
+    plt.figure(figsize=(10, 4))
+    years_array = np.asarray(all_years, dtype=np.float32)
+    for summary, label, color in (
+        (learned_summary, "Learned policy", "#1f77b4"),
+        (expert_summary, "Expert policy", "#ff7f0e"),
+    ):
+        stats = summary.reindex(all_years)
+        means = stats["mean"].to_numpy()
+        stds = stats["std"].fillna(0.0).to_numpy()
+        valid = np.isfinite(means)
+        if not np.any(valid):
+            continue
+        if multi_episode:
+            plt.errorbar(
+                years_array[valid],
+                means[valid],
+                yerr=stds[valid],
+                marker="o",
+                linewidth=1.5,
+                capsize=3,
+                label=label,
+                color=color,
+            )
+        else:
+            plt.plot(
+                years_array[valid],
+                means[valid],
+                marker="o",
+                linewidth=1.5,
+                label=label,
+                color=color,
+            )
+    plt.xlabel("Year")
+    plt.ylabel("Cumulative reward")
+    plt.title("Cumulative Reward: Learned vs Expert Policy")
+    plt.grid(True, axis="both", alpha=0.3)
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+
+def plot_expected_loss_comparison(
+    learned_df: pd.DataFrame,
+    expert_df: pd.DataFrame,
+    *,
+    output_path: str,
+    multi_episode: bool,
+) -> None:
+    """Compare (1 - expected loss) for gas and electricity between learned and expert policies."""
+    if learned_df.empty or expert_df.empty:
+        print("Skipping loss comparison plot because one of the datasets is empty.")
+        return
+
+    def loss_summary(df: pd.DataFrame, column: str) -> pd.DataFrame:
+        trimmed = df.dropna(subset=[column]).copy()
+        if trimmed.empty:
+            return pd.DataFrame(columns=["mean", "std"])
+        complement = 1.0 - trimmed[column].astype(float)
+        trimmed["complement"] = complement
+        return trimmed.groupby("year")["complement"].agg(["mean", "std"])
+
+    metrics = [
+        ("gas_loss_mean", "Expected gas availability", "#2ca02c"),
+        ("elec_loss_mean", "Expected electricity availability", "#d62728"),
+    ]
+
+    summaries = []
+    all_years: set[int] = set()
+    for column, _, _ in metrics:
+        learned_stats = loss_summary(learned_df, column)
+        expert_stats = loss_summary(expert_df, column)
+        summaries.append((column, learned_stats, expert_stats))
+        all_years.update(learned_stats.index.tolist())
+        all_years.update(expert_stats.index.tolist())
+
+    if not all_years:
+        print("No loss statistics available; skipping loss comparison plot.")
+        return
+
+    years_sorted = sorted(all_years)
+    years_array = np.asarray(years_sorted, dtype=np.float32)
+    fig, axes = plt.subplots(len(metrics), 1, figsize=(10, 3.5 * len(metrics)), sharex=True)
+    if len(metrics) == 1:
+        axes = [axes]
+
+    for ax, (column, learned_stats, expert_stats), metric_info in zip(
+        axes,
+        summaries,
+        metrics,
+    ):
+        _, title, _ = metric_info
+        for stats, label, color in (
+            (learned_stats.reindex(years_sorted), "Learned policy", "#1f77b4"),
+            (expert_stats.reindex(years_sorted), "Expert policy", "#ff7f0e"),
+        ):
+            means = stats["mean"].to_numpy()
+            stds = stats["std"].fillna(0.0).to_numpy()
+            valid = np.isfinite(means)
+            if not np.any(valid):
+                continue
+            if multi_episode:
+                ax.errorbar(
+                    years_array[valid],
+                    means[valid],
+                    yerr=stds[valid],
+                    marker="o",
+                    linewidth=1.5,
+                    capsize=3,
+                    label=label,
+                    color=color,
+                )
+            else:
+                ax.plot(
+                    years_array[valid],
+                    means[valid],
+                    marker="o",
+                    linewidth=1.5,
+                    label=label,
+                    color=color,
+                )
+        ax.set_ylabel(title)
+        ax.grid(True, axis="both", alpha=0.3)
+        ax.legend(loc="best")
+
+    axes[-1].set_xlabel("Year")
+    fig.suptitle("Expected Availability Comparison: Learned vs Expert")
+    fig.tight_layout(rect=[0, 0.02, 1, 0.96])
+    fig.savefig(output_path)
+    plt.close(fig)
 
 
 def save_logs(
@@ -288,6 +599,8 @@ def save_logs(
         "prev_loss": [info.get("prev_loss", np.nan) for info in infos_log],
         "base_loss": [info.get("base_loss", np.nan) for info in infos_log],
         "new_loss": [info.get("new_loss", np.nan) for info in infos_log],
+        "gas_loss_mean": [info.get("gas_loss_mean", np.nan) for info in infos_log],
+        "elec_loss_mean": [info.get("elec_loss_mean", np.nan) for info in infos_log],
     }
 
     expected_depth_mean_cols = {
@@ -600,11 +913,34 @@ def save_logs(
     plt.figure(figsize=(10, 4))
     asset_labels = [ASSET_NAMES[idx] if idx < len(ASSET_NAMES) else f"Asset {idx}" for idx in range(cost_stack.shape[1])]
     plt.bar(asset_labels, total_cost_per_asset, color="#4C72B0")
+    plt.ylim(0, 1.2*10**7)
     plt.ylabel("Total cost spent")
     plt.title("Total Cost Spent Per Asset")
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
     plt.savefig(os.path.join(RESULTS_DIR, "cost_by_asset.png"))
+    plt.close()
+
+    category_map = _component_category_map()
+    asset_categories = [category_map.get(name, "unclassified") for name in ASSET_NAMES]
+    category_totals: Dict[str, float] = {}
+    for idx, category in enumerate(asset_categories):
+        category_totals[category] = category_totals.get(category, 0.0) + float(total_cost_per_asset[idx])
+
+    gas_categories = {"lng", "compressor"}
+    gas_total = sum(category_totals.get(cat, 0.0) for cat in gas_categories)
+    electricity_total = sum(category_totals.values()) - gas_total
+    group_labels = ["Gas assets", "Electricity assets"]
+    grouped_totals = [gas_total, electricity_total]
+
+    plt.figure(figsize=(10, 4))
+    plt.bar(group_labels, grouped_totals, color=["#55A868", "#4C72B0"])
+    plt.ylim(0, 5*10**6)
+    plt.ylabel("Total cost spent")
+    plt.title("Total Cost by Asset Group")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(RESULTS_DIR, "cost_by_group.png"))
     plt.close()
 
     plt.figure(figsize=(10, 4))
@@ -1025,6 +1361,8 @@ def save_logs(
         plt.savefig(os.path.join(RESULTS_DIR, "sea_level_over_time.png"))
         plt.close()
 
+    return df
+
 
 def main() -> None:
     if USE_BEST_MODEL:
@@ -1073,6 +1411,9 @@ def main() -> None:
         },
     }
 
+    ppo_action_selector = make_model_action_selector(model, deterministic_eval)
+    ppo_episode_label = "Episode" if num_episodes > 1 else ""
+    episode_seeds: List[int] = []
     all_actions: List[np.ndarray] = []
     all_obs: List[np.ndarray] = []
     all_rewards: List[float] = []
@@ -1084,11 +1425,12 @@ def main() -> None:
 
     for episode_idx in range(num_episodes):
         episode_seed = EVAL_SEED if deterministic_eval else EVAL_SEED + episode_idx
+        episode_seeds.append(episode_seed)
         actions_log, obs_log, rewards_log, infos_log, penalty_summary = rollout_episode(
-            model,
+            ppo_action_selector,
             seed=episode_seed,
-            deterministic=deterministic_eval,
             episode_idx=episode_idx if num_episodes > 1 else None,
+            episode_label=ppo_episode_label,
         )
 
         episode_length = len(actions_log)
@@ -1109,7 +1451,7 @@ def main() -> None:
             for stat_key, value in stats.items():
                 aggregated_penalties[key][stat_key] += float(value)
 
-    save_logs(
+    ppo_df = save_logs(
         all_actions,
         all_obs,
         all_rewards,
@@ -1162,6 +1504,63 @@ def main() -> None:
         print(
             f"Average over-budget amount per offending step: {avg_over_amount:.3f} "
             f"(penalty contribution: {avg_over_penalty:.3f})"
+        )
+
+    expert_episode_lengths: List[int] = []
+    expert_rewards: List[float] = []
+    expert_episode_ids: List[int] = []
+    expert_step_years: List[int] = []
+    expert_step_indices: List[int] = []
+    expert_gas_losses: List[float] = []
+    expert_elec_losses: List[float] = []
+
+    for expert_idx, seed in enumerate(episode_seeds):
+        actions_log, _, rewards_log, infos_log, _ = rollout_episode(
+            expert_action_selector,
+            seed=seed,
+            episode_idx=expert_idx if num_episodes > 1 else None,
+            episode_label="Expert",
+        )
+        expert_episode_lengths.append(len(actions_log))
+        for step_idx, (reward, info) in enumerate(zip(rewards_log, infos_log)):
+            expert_rewards.append(float(reward))
+            expert_episode_ids.append(expert_idx)
+            expert_step_years.append(step_idx * year_step)
+            expert_step_indices.append(step_idx)
+            expert_gas_losses.append(float(info.get("gas_loss_mean", np.nan)))
+            expert_elec_losses.append(float(info.get("elec_loss_mean", np.nan)))
+
+    expert_df = pd.DataFrame(
+        {
+            "reward": expert_rewards,
+            "year": expert_step_years,
+            "episode": expert_episode_ids,
+            "step_in_episode": expert_step_indices,
+            "gas_loss_mean": expert_gas_losses,
+            "elec_loss_mean": expert_elec_losses,
+        }
+    )
+    comparison_path = os.path.join(RESULTS_DIR, "reward_comparison_expert.png")
+    loss_comparison_path = os.path.join(RESULTS_DIR, "loss_comparison_expert.png")
+    if expert_df.empty:
+        print("Expert policy produced no steps; skipping reward comparison plot.")
+    else:
+        plot_reward_comparison(
+            ppo_df.loc[:, ["year", "reward", "episode", "step_in_episode"]],
+            expert_df,
+            output_path=comparison_path,
+            multi_episode=num_episodes > 1,
+        )
+        plot_expected_loss_comparison(
+            ppo_df.loc[:, ["year", "episode", "step_in_episode", "gas_loss_mean", "elec_loss_mean"]],
+            expert_df.loc[:, ["year", "episode", "step_in_episode", "gas_loss_mean", "elec_loss_mean"]],
+            output_path=loss_comparison_path,
+            multi_episode=num_episodes > 1,
+        )
+        print(
+            f"Expert policy steps per episode: {expert_episode_lengths}\n"
+            f"Reward comparison saved to {comparison_path}\n"
+            f"Availability comparison saved to {loss_comparison_path}"
         )
 
 

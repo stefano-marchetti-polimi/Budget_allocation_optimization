@@ -8,6 +8,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 import zipfile
 import xml.etree.ElementTree as ET
 import pandas as pd
+import math
 from utils.fragility_curves import (
     fragility_PV,
     fragility_substation,
@@ -73,6 +74,10 @@ class NetworkConfig:
     substation_industrial: Dict[str, float]
     compressor_residential: Dict[str, float]
     substation_residential: Dict[str, float]
+    county_coordinates: Dict[str, Tuple[float, float]]
+    county_population: Dict[str, float]
+    asset_counties: Dict[str, Tuple[str, ...]]
+    county_display_names: Dict[str, str]
 
 
 def _format_component_name(raw: str) -> str:
@@ -223,6 +228,9 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
     population_map: Dict[str, float] = {}
     industrial_population_map: Dict[str, float] = {}
     residential_population_map: Dict[str, float] = {}
+    county_coordinates: Dict[str, Tuple[float, float]] = {}
+    county_population: Dict[str, float] = {}
+    county_display_names: Dict[str, str] = {}
     for row in population_rows:
         county = row.get("County")
         pop = row.get("Population Size")
@@ -231,6 +239,20 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         key = _format_component_name(county)
         total_pop = float(pop)
         population_map[key] = total_pop
+        county_display_names[key] = str(county)
+        county_population[key] = total_pop
+
+        east = row.get("UTM Easting")
+        north = row.get("UTM Northing")
+        if east not in (None, "") and north not in (None, ""):
+            try:
+                easting_val = float(east)
+                northing_val = float(north)
+            except (TypeError, ValueError):
+                easting_val = northing_val = None
+            else:
+                if np.isfinite(easting_val) and np.isfinite(northing_val):
+                    county_coordinates[key] = (easting_val, northing_val)
 
         def _fraction(value: object) -> float:
             if value in (None, "", "NA"):
@@ -366,123 +388,156 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         "Comp_Freeport": ("Freeport_CCGT", "Bacliff_CCGT", "Galveston_CCGT"),
     }
 
-    compressor_counties = {
-        "Comp_Sabine": ("Jefferson", "Orange"),
-        "Comp_Calcasieu": ("Liberty", "Chambers", "Hardin"),
-        "Comp_CedarBayou": ("Harris",),
-        "Comp_Freeport": ("Brazoria", "Galveston", "Fort_Bend"),
-    }
-
-    # Compressor stations (dependencies handled later)
     compressor_dependencies = {
         "Comp_Sabine": ("Calcasieu_Pass_LNG",),
         "Comp_Calcasieu": ("Calcasieu_Pass_LNG",),
         "Comp_CedarBayou": ("Calcasieu_Pass_LNG",),
         "Comp_Freeport": ("Calcasieu_Pass_LNG",),
     }
-    compressor_industrial_load: Dict[str, float] = {}
-    compressor_residential_load: Dict[str, float] = {}
+
+    def _distance(pt_a: Tuple[float, float], pt_b: Tuple[float, float]) -> float:
+        return math.hypot(pt_a[0] - pt_b[0], pt_a[1] - pt_b[1])
+
+    asset_counties: Dict[str, Tuple[str, ...]] = {}
+
+    compressor_info: Dict[str, Dict[str, object]] = {}
     for name, deps in compressor_dependencies.items():
         feed_assets = compressor_feeds.get(name, ())
         supply_capacity = sum(capacity_map.get(asset, 0.0) for asset in feed_assets)
         centroid = _weighted_centroid(feed_assets)
         if centroid is None:
             centroid = coordinate_map.get("Calcasieu_Pass_LNG")
-        counties = compressor_counties.get(name, ())
-        industrial_load = 0.0
-        residential_load = 0.0
-        for county in counties:
-            key = _format_component_name(county)
-            industrial_load += industrial_population_map.get(key, 0.0)
-            residential_load += residential_population_map.get(key, 0.0)
+        if centroid is None:
+            raise ValueError(f"Cannot determine coordinate for compressor '{name}'.")
+        compressor_info[name] = {
+            "coordinate": centroid,
+            "dependencies": tuple(deps),
+            "supply_capacity": supply_capacity,
+        }
+        coordinate_map[name] = centroid
+        capacity_map[name] = supply_capacity
+
+    compressor_counties: Dict[str, List[str]] = {name: [] for name in compressor_info}
+    for county_key, coord in county_coordinates.items():
+        if coord is None:
+            continue
+        best_name = min(
+            compressor_info,
+            key=lambda comp: _distance(coord, compressor_info[comp]["coordinate"]),  # type: ignore[index]
+        )
+        compressor_counties[best_name].append(county_key)
+
+    compressor_industrial_load: Dict[str, float] = {}
+    compressor_residential_load: Dict[str, float] = {}
+    compressor_people: Dict[str, float] = {}
+    compressor_supply: Dict[str, float] = {}
+    for name, info in compressor_info.items():
+        assigned_counties = compressor_counties.get(name, [])
+        industrial_load = sum(industrial_population_map.get(county, 0.0) for county in assigned_counties)
+        residential_load = sum(residential_population_map.get(county, 0.0) for county in assigned_counties)
+        population_total = sum(population_map.get(county, 0.0) for county in assigned_counties)
         compressor_industrial_load[name] = industrial_load
         compressor_residential_load[name] = residential_load
+        compressor_people[name] = population_total
+        compressor_supply[name] = info["supply_capacity"]  # type: ignore[index]
         components.append(
             ComponentConfig(
                 name=name,
                 category="compressor",
                 hazard_key=name,
-                area=_estimate_area("compressor", supply_capacity),
-                dependencies=tuple(deps),
-                capacity=supply_capacity,
-                coordinate=centroid,
+                area=_estimate_area("compressor", info["supply_capacity"]),  # type: ignore[index]
+                dependencies=info["dependencies"],  # type: ignore[index]
+                capacity=info["supply_capacity"],  # type: ignore[index]
+                coordinate=info["coordinate"],  # type: ignore[index]
                 upgradable=True,
                 can_fail=True,
                 industrial_load=industrial_load,
                 residential_load=residential_load,
             )
         )
-        if centroid is not None:
-            coordinate_map[name] = centroid
-        capacity_map[name] = supply_capacity
+        asset_counties[name] = tuple(assigned_counties)
 
-    substation_generators: Dict[str, Tuple[str, ...]] = {
-        "Sub_Harris_ShipChannel": ("Channelview_CCGT", "Cedar_Bayou_CCGT", "Galveston_1_Wind", "Galveston_2_Wind", "Red_Bluff_Road_Solar"),
-        "Sub_FortBend_Expansion": ("Freeport_CCGT", "Cottonwood_Bayou_Solar", "Myrtle_Solar"),
-        "Sub_Galveston_Island": ("Galveston_1_Wind", "Galveston_2_Wind", "Galveston_CCGT", "Bacliff_CCGT"),
-        "Sub_Brazoria_Gulf": ("Freeport_CCGT", "Cottonwood_Bayou_Solar", "Bacliff_CCGT", "Brazoria_West_Solar"),
-        "Sub_Jefferson_Orange": ("Roy_S_Nelson_Coal", "Sabine_CCGT", "Port_Arthur_CCGT", "Lake_Charles_Wind", "Lake_Charles_CCGT"),
-        "Sub_Liberty_Chambers": ("Cedar_Bayou_CCGT", "Channelview_CCGT", "Cottonwood_Gas", "Liberty_1_Solar", "Trinity_River_Solar"),
-    }
+    generator_assets = [
+        spec["name"]
+        for spec in generation_defs + thermal_defs
+        if spec["category"] in {"renewable", "thermal"}
+    ]
 
-    substation_counties = {
-        "Sub_Harris_ShipChannel": ("Harris",),
-        "Sub_FortBend_Expansion": ("Fort_Bend",),
-        "Sub_Galveston_Island": ("Galveston",),
-        "Sub_Brazoria_Gulf": ("Brazoria",),
-        "Sub_Jefferson_Orange": ("Jefferson", "Orange"),
-        "Sub_Liberty_Chambers": ("Liberty", "Chambers", "Hardin"),
-    }
+    def _offset_substation(county_key: str, base_coord: Tuple[float, float], distance: float = 4_500.0) -> Tuple[float, float]:
+        angle = (abs(hash(("substation", county_key))) % 3600) / 3600.0 * 2.0 * math.pi
+        return (
+            base_coord[0] + distance * math.cos(angle),
+            base_coord[1] + distance * math.sin(angle),
+        )
 
     substation_people: Dict[str, float] = {}
-    for name, counties in substation_counties.items():
-        total = sum(population_map.get(_format_component_name(county), 0.0) for county in counties)
-        substation_people[name] = total
-
     substation_industrial_load: Dict[str, float] = {}
     substation_residential_load: Dict[str, float] = {}
-    for name, generators in substation_generators.items():
-        capacity = sum(capacity_map.get(gen, 0.0) for gen in generators)
-        population = substation_people.get(name, 0.0)
-        centroid = _weighted_centroid(generators)
-        if centroid is None:
-            centroid = coordinate_map.get("Calcasieu_Pass_LNG")
-        counties = substation_counties.get(name, ())
-        industrial_load = 0.0
-        residential_load = 0.0
-        for county in counties:
-            key = _format_component_name(county)
-            industrial_load += industrial_population_map.get(key, 0.0)
-            residential_load += residential_population_map.get(key, 0.0)
-        substation_industrial_load[name] = industrial_load
-        substation_residential_load[name] = residential_load
+    substation_supply: Dict[str, float] = {}
+    substation_info: Dict[str, Dict[str, object]] = {}
+
+    for county_key, coord in county_coordinates.items():
+        if coord is None or not generator_assets:
+            continue
+        nearest_generator = min(
+            generator_assets,
+            key=lambda gen: _distance(coord, coordinate_map[gen]),
+        )
+        substation_name = f"Sub_{county_key}"
+        substation_coord = _offset_substation(county_key, coord)
+        population_total = population_map.get(county_key, 0.0)
+        industrial_load = industrial_population_map.get(county_key, 0.0)
+        residential_load = residential_population_map.get(county_key, 0.0)
+        substation_info[substation_name] = {
+            "coordinate": substation_coord,
+            "generators": {nearest_generator},
+            "population": population_total,
+            "industrial": industrial_load,
+            "residential": residential_load,
+            "counties": (county_key,),
+        }
+
+    # Ensure every generator feeds at least one substation by attaching missing generators to nearest substation
+    generator_assignments: Dict[str, str] = {}
+    for sub_name, info in substation_info.items():
+        for gen in info["generators"]:
+            generator_assignments[gen] = sub_name  # type: ignore[index]
+    for generator in generator_assets:
+        if generator not in generator_assignments and generator in coordinate_map:
+            best_substation = min(
+                substation_info.keys(),
+                key=lambda sub: _distance(coordinate_map[generator], substation_info[sub]["coordinate"]),  # type: ignore[index]
+            )
+            substation_info[best_substation]["generators"].add(generator)  # type: ignore[index]
+
+    for substation_name, info in substation_info.items():
+        coord = info["coordinate"]  # type: ignore[assignment]
+        generators = sorted(info["generators"])  # type: ignore[index]
+        population_total = float(info["population"])  # type: ignore[index]
+        industrial_load = float(info["industrial"])  # type: ignore[index]
+        residential_load = float(info["residential"])  # type: ignore[index]
+        capacity = float(sum(capacity_map.get(gen, 0.0) for gen in generators))
         components.append(
             ComponentConfig(
-                name=name,
+                name=substation_name,
                 category="substation",
-                hazard_key=name,
-                area=_estimate_area("substation", capacity, population),
-                generator_sources=generators,
-                population=population,
+                hazard_key=substation_name,
+                area=_estimate_area("substation", capacity, population_total),
+                generator_sources=tuple(generators),
+                population=population_total,
                 capacity=capacity,
-                coordinate=centroid,
+                coordinate=coord,
                 industrial_load=industrial_load,
                 residential_load=residential_load,
             )
         )
-        if centroid is not None:
-            coordinate_map[name] = centroid
-        capacity_map[name] = capacity
-
-    compressor_supply: Dict[str, float] = {}
-    for name, plants in compressor_feeds.items():
-        compressor_supply[name] = sum(capacity_map.get(plant, 0.0) for plant in plants)
-
-    compressor_people: Dict[str, float] = {}
-    for name, counties in compressor_counties.items():
-        compressor_people[name] = sum(population_map.get(_format_component_name(county), 0.0) for county in counties)
-
-    substation_supply = {name: capacity_map.get(name, 0.0) for name in substation_generators}
+        coordinate_map[substation_name] = coord  # type: ignore[assignment]
+        capacity_map[substation_name] = capacity
+        substation_people[substation_name] = population_total
+        substation_industrial_load[substation_name] = industrial_load
+        substation_residential_load[substation_name] = residential_load
+        substation_supply[substation_name] = capacity
+        asset_counties[substation_name] = tuple(info["counties"])  # type: ignore[index]
 
     return NetworkConfig(
         components=tuple(components),
@@ -494,6 +549,10 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         substation_industrial=substation_industrial_load,
         compressor_residential=compressor_residential_load,
         substation_residential=substation_residential_load,
+        county_coordinates=county_coordinates,
+        county_population=county_population,
+        asset_counties=asset_counties,
+        county_display_names=county_display_names,
     )
 
 class TrialEnv(gym.Env):
@@ -707,20 +766,8 @@ class TrialEnv(gym.Env):
         self.area = area_array
 
         # Compressor and substation supply/population distributions derived from catalog data
-        self.compressor_order = [
-            "Comp_Sabine",
-            "Comp_Calcasieu",
-            "Comp_CedarBayou",
-            "Comp_Freeport",
-        ]
-        self.substation_order = [
-            "Sub_Harris_ShipChannel",
-            "Sub_FortBend_Expansion",
-            "Sub_Galveston_Island",
-            "Sub_Brazoria_Gulf",
-            "Sub_Jefferson_Orange",
-            "Sub_Liberty_Chambers",
-        ]
+        self.compressor_order = sorted(network_config.compressor_supply.keys())
+        self.substation_order = sorted(network_config.substation_supply.keys())
 
         def _array_from_mapping(order: Sequence[str], mapping: Dict[str, float], label: str) -> np.ndarray:
             values = []
