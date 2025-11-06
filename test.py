@@ -24,9 +24,13 @@ from stable_baselines3 import PPO
 USE_BEST_MODEL = True
 BEST_MODEL_FILENAME = "best_model.zip"
 
+# Optional override to force evaluation under a specific decision-maker scenario.
+# Set to None to reuse the scenario defined in `optimization_parallel.py`.
+DM_SCENARIO_OVERRIDE = "gas-economic"
+
 # Optional absolute/relative path to override the training `RESULTS_DIR`.
 # Leave as None to reuse the path from `optimization_parallel.py`.
-RESULTS_DIR_OVERRIDE = "results_gas_economic_SSP5-8.5"
+RESULTS_DIR_OVERRIDE = "results_All_All"
 
 # Set USE_LATEST_CHECKPOINT to True to automatically load the newest checkpoint inside
 # results/checkpoints. Set it to False and provide POLICY_PATH (with or without .zip)
@@ -65,11 +69,15 @@ if RESULTS_DIR_OVERRIDE:
     CHECKPOINT_DIR = os.path.join(RESULTS_DIR, "checkpoints")
     BEST_MODEL_DIR = os.path.join(RESULTS_DIR, "best_models")
 
+EVAL_ENV_KWARGS = dict(env_kwargs)
+if DM_SCENARIO_OVERRIDE is not None:
+    EVAL_ENV_KWARGS["dm_scenario"] = DM_SCENARIO_OVERRIDE
+
 
 @lru_cache(maxsize=1)
 def _component_category_map() -> Dict[str, str]:
     """Return a cached mapping from asset name to its category."""
-    env = TrialEnv(**env_kwargs)
+    env = TrialEnv(**EVAL_ENV_KWARGS)
     try:
         return dict(env.component_categories)
     finally:
@@ -152,7 +160,7 @@ def rollout_episode(
     Dict[str, Dict[str, float]],
 ]:
     """Run one evaluation episode with the provided action selector, tracking penalties."""
-    env = TrialEnv(**env_kwargs)
+    env = TrialEnv(**EVAL_ENV_KWARGS)
     obs, _ = env.reset(seed=seed)
 
     actions_log: List[np.ndarray] = []
@@ -640,6 +648,7 @@ def save_logs(
             for info in infos_log
         ],
         "climate_scenario": [info.get("climate_scenario", "") for info in infos_log],
+        "dm_scenario": [info.get("dm_scenario", "") for info in infos_log],
     }
 
     total_steps = len(actions_log)
@@ -673,7 +682,7 @@ def save_logs(
     multi_episode = df["episode"].nunique() > 1
     years_axis = df["year"].to_numpy()
 
-    budget_cap = float(env_kwargs.get("budget", 0.0))
+    budget_cap = float(EVAL_ENV_KWARGS.get("budget", 0.0))
     df["cumulative_spend"] = df.groupby("episode")["total_cost"].cumsum()
     if budget_cap > 0.0:
         df["cumulative_budget_cap"] = (df["step_in_episode"] + 1) * budget_cap
@@ -1207,11 +1216,15 @@ def save_logs(
             plt.xlabel("Year")
             plt.ylabel("Meters")
             title = f"Flood Depth vs. {asset_label} Height"
-            scenario_labels = df["climate_scenario"].dropna().unique().tolist()
-            if scenario_labels:
-                sample = ", ".join(sorted(label for label in scenario_labels if label))
-                if sample:
-                    title += f" ({sample})"
+            climate_labels = sorted(label for label in df["climate_scenario"].dropna().unique().tolist() if label)
+            dm_labels = sorted(label for label in df["dm_scenario"].dropna().unique().tolist() if label)
+            label_parts = []
+            if climate_labels:
+                label_parts.append(f"Climate: {', '.join(climate_labels)}")
+            if dm_labels:
+                label_parts.append(f"DM: {', '.join(dm_labels)}")
+            if label_parts:
+                title += f" ({'; '.join(label_parts)})"
             plt.title(title)
             plt.grid(True, axis="both", alpha=0.3)
             plt.legend(loc="best")
@@ -1346,12 +1359,16 @@ def save_logs(
                     linewidth=1.2,
                     label="Delta",
                 )
-        scenario_labels = df["climate_scenario"].dropna().unique().tolist()
         title = "Sea Level Path"
-        if scenario_labels:
-            sample = ", ".join(sorted(label for label in scenario_labels if label))
-            if sample:
-                title += f" ({sample})"
+        climate_labels = sorted(label for label in df["climate_scenario"].dropna().unique().tolist() if label)
+        dm_labels = sorted(label for label in df["dm_scenario"].dropna().unique().tolist() if label)
+        label_parts = []
+        if climate_labels:
+            label_parts.append(f"Climate: {', '.join(climate_labels)}")
+        if dm_labels:
+            label_parts.append(f"DM: {', '.join(dm_labels)}")
+        if label_parts:
+            title += f" ({'; '.join(label_parts)})"
         plt.xlabel("Year")
         plt.ylabel("Sea level (m)")
         plt.title(title)

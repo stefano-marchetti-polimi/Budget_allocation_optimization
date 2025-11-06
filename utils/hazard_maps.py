@@ -33,7 +33,17 @@ def _build_hazard_coordinates(data_dir: Path) -> Dict[str, Tuple[float, float]]:
         coord = component.coordinate
         if coord is None:
             continue
-        hazard_coords[component.hazard_key] = (float(coord[0]), float(coord[1]))
+        key = component.hazard_key
+        candidate = (float(coord[0]), float(coord[1]))
+        if key in hazard_coords:
+            existing = hazard_coords[key]
+            if not np.allclose(existing, candidate, atol=1e-3):
+                raise ValueError(
+                    f"Hazard key '{key}' has conflicting coordinates: "
+                    f"{existing} vs {candidate}."
+                )
+            continue
+        hazard_coords[key] = candidate
     if not hazard_coords:
         raise RuntimeError("No hazard points derived from asset catalog.")
     return hazard_coords
@@ -81,7 +91,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ocean-easting", type=float, default=DEFAULT_OCEAN_COORD[0], help="Easting of offshore forcing cell.")
     parser.add_argument("--ocean-northing", type=float, default=DEFAULT_OCEAN_COORD[1], help="Northing of offshore forcing cell.")
     parser.add_argument("--min-level", type=float, default=0.0, help="Minimum gauge elevation (m).")
-    parser.add_argument("--max-level", type=float, default=8.0, help="Maximum gauge elevation (m).")
+    parser.add_argument("--max-level", type=float, default=10.0, help="Maximum gauge elevation (m).")
     parser.add_argument("--num-levels", type=int, default=100, help="Number of evenly spaced gauge levels.")
     return parser.parse_args()
 

@@ -43,7 +43,7 @@ CATEGORY_LABELS: Mapping[str, str] = {
     "renewable": "Renewable Generation",
     "thermal": "Thermal Generation",
     "lng": "Fuel Supply",
-    "compressor": "Gas Compression",
+    "compressor": "Gas Compression (per plant)",
     "substation": "Electrical Distribution",
 }
 
@@ -71,10 +71,14 @@ def _network_snapshot() -> Dict[str, object]:
         for cfg in network.components
         if cfg.dependencies
     }
+    compressor_set = {cfg.name for cfg in network.components if cfg.category == "compressor"}
+    compressor_assignments: Dict[str, str] = {}
     edges: set[Tuple[str, str]] = set()
     for cfg in network.components:
         for dep in cfg.dependencies:
             edges.add((dep, cfg.name))
+            if cfg.category == "thermal" and dep in compressor_set:
+                compressor_assignments[dep] = cfg.name
         for source in cfg.generator_sources:
             edges.add((source, cfg.name))
     category_map = {cfg.name: cfg.category for cfg in network.components}
@@ -102,6 +106,7 @@ def _network_snapshot() -> Dict[str, object]:
         "county_population": network.county_population,
         "asset_counties": network.asset_counties,
         "county_display_names": network.county_display_names,
+        "compressor_assignments": compressor_assignments,
     }
 
 

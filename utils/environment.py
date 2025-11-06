@@ -341,16 +341,93 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         {"name": "Brazoria_West_Solar", "source": ("electric", "Brazoria_West"), "category": "renewable"},
     ]
 
+    def _compressor_name(asset_name: str) -> str:
+        return f"Comp_{asset_name}"
+
+    LNG_DEPENDENCY = ("Calcasieu_Pass_LNG",)
+
     thermal_defs = [
-        {"name": "Sabine_CCGT", "source": ("gas", "Sabine"), "category": "thermal", "dependencies": ("Comp_Sabine",)},
-        {"name": "Port_Arthur_CCGT", "source": ("gas", "Porth_Arthur"), "category": "thermal", "dependencies": ("Comp_Sabine",)},
-        {"name": "Lake_Charles_CCGT", "source": ("gas", "Lake_Charles"), "category": "thermal", "dependencies": ("Comp_Calcasieu",)},
-        {"name": "Cottonwood_Gas", "source": ("gas", "Cottonwood"), "category": "thermal", "dependencies": ("Comp_Calcasieu",)},
-        {"name": "Cedar_Bayou_CCGT", "source": ("gas", "Cedar_Bayou"), "category": "thermal", "dependencies": ("Comp_CedarBayou",)},
-        {"name": "Channelview_CCGT", "source": ("gas", "Channelview"), "category": "thermal", "dependencies": ("Comp_CedarBayou",)},
-        {"name": "Bacliff_CCGT", "source": ("gas", "Bacliff"), "category": "thermal", "dependencies": ("Comp_Freeport",)},
-        {"name": "Galveston_CCGT", "source": ("gas", "Galveston"), "category": "thermal", "dependencies": ("Comp_Freeport",)},
-        {"name": "Freeport_CCGT", "source": ("gas", "Free_Port"), "category": "thermal", "dependencies": ("Comp_Freeport",)},
+        {
+            "name": "Sabine_CCGT",
+            "source": ("gas", "Sabine"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Sabine_CCGT"),),
+            "compressor": _compressor_name("Sabine_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Sabine_CCGT"),
+        },
+        {
+            "name": "Port_Arthur_CCGT",
+            "source": ("gas", "Porth_Arthur"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Port_Arthur_CCGT"),),
+            "compressor": _compressor_name("Port_Arthur_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Port_Arthur_CCGT"),
+        },
+        {
+            "name": "Lake_Charles_CCGT",
+            "source": ("gas", "Lake_Charles"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Lake_Charles_CCGT"),),
+            "compressor": _compressor_name("Lake_Charles_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Lake_Charles_CCGT"),
+        },
+        {
+            "name": "Cottonwood_Gas",
+            "source": ("gas", "Cottonwood"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Cottonwood_Gas"),),
+            "compressor": _compressor_name("Cottonwood_Gas"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Cottonwood_Gas"),
+        },
+        {
+            "name": "Cedar_Bayou_CCGT",
+            "source": ("gas", "Cedar_Bayou"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Cedar_Bayou_CCGT"),),
+            "compressor": _compressor_name("Cedar_Bayou_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Cedar_Bayou_CCGT"),
+        },
+        {
+            "name": "Channelview_CCGT",
+            "source": ("gas", "Channelview"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Channelview_CCGT"),),
+            "compressor": _compressor_name("Channelview_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Channelview_CCGT"),
+        },
+        {
+            "name": "Bacliff_CCGT",
+            "source": ("gas", "Bacliff"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Bacliff_CCGT"),),
+            "compressor": _compressor_name("Bacliff_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Bacliff_CCGT"),
+        },
+        {
+            "name": "Galveston_CCGT",
+            "source": ("gas", "Galveston"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Galveston_CCGT"),),
+            "compressor": _compressor_name("Galveston_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Galveston_CCGT"),
+        },
+        {
+            "name": "Freeport_CCGT",
+            "source": ("gas", "Free_Port"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Freeport_CCGT"),),
+            "compressor": _compressor_name("Freeport_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Freeport_CCGT"),
+        },
     ]
 
     offshore_wind_assets = {"Galveston_1_Wind", "Galveston_2_Wind", "Lake_Charles_Wind"}
@@ -381,19 +458,23 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
         capacity_map[spec["name"]] = capacity
         coordinate_map[spec["name"]] = coord
 
-    compressor_feeds = {
-        "Comp_Sabine": ("Sabine_CCGT", "Port_Arthur_CCGT"),
-        "Comp_Calcasieu": ("Lake_Charles_CCGT", "Cottonwood_Gas"),
-        "Comp_CedarBayou": ("Cedar_Bayou_CCGT", "Channelview_CCGT"),
-        "Comp_Freeport": ("Freeport_CCGT", "Bacliff_CCGT", "Galveston_CCGT"),
-    }
-
-    compressor_dependencies = {
-        "Comp_Sabine": ("Calcasieu_Pass_LNG",),
-        "Comp_Calcasieu": ("Calcasieu_Pass_LNG",),
-        "Comp_CedarBayou": ("Calcasieu_Pass_LNG",),
-        "Comp_Freeport": ("Calcasieu_Pass_LNG",),
-    }
+    compressor_specs: Dict[str, Dict[str, object]] = {}
+    for spec in thermal_defs:
+        comp_name = spec.get("compressor")
+        if not comp_name:
+            continue
+        if comp_name in compressor_specs:
+            raise ValueError(f"Duplicate compressor definition for '{comp_name}'.")
+        feed_assets = (spec["name"],)
+        dependencies = tuple(spec.get("compressor_dependencies", LNG_DEPENDENCY))
+        hazard_key = spec.get("compressor_hazard_key")
+        if hazard_key is None:
+            hazard_key = feed_assets[0]
+        compressor_specs[comp_name] = {
+            "feed_assets": feed_assets,
+            "dependencies": dependencies,
+            "hazard_key": hazard_key,
+        }
 
     def _distance(pt_a: Tuple[float, float], pt_b: Tuple[float, float]) -> float:
         return math.hypot(pt_a[0] - pt_b[0], pt_a[1] - pt_b[1])
@@ -401,18 +482,22 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
     asset_counties: Dict[str, Tuple[str, ...]] = {}
 
     compressor_info: Dict[str, Dict[str, object]] = {}
-    for name, deps in compressor_dependencies.items():
-        feed_assets = compressor_feeds.get(name, ())
+    for name, spec in compressor_specs.items():
+        feed_assets = tuple(spec.get("feed_assets", ()))
+        if not feed_assets:
+            raise ValueError(f"Compressor '{name}' does not reference any feed assets.")
         supply_capacity = sum(capacity_map.get(asset, 0.0) for asset in feed_assets)
         centroid = _weighted_centroid(feed_assets)
         if centroid is None:
-            centroid = coordinate_map.get("Calcasieu_Pass_LNG")
+            first_feed = feed_assets[0]
+            centroid = coordinate_map.get(first_feed, coordinate_map.get("Calcasieu_Pass_LNG"))
         if centroid is None:
             raise ValueError(f"Cannot determine coordinate for compressor '{name}'.")
         compressor_info[name] = {
             "coordinate": centroid,
-            "dependencies": tuple(deps),
+            "dependencies": tuple(spec.get("dependencies", ())),
             "supply_capacity": supply_capacity,
+            "hazard_key": spec.get("hazard_key", name),
         }
         coordinate_map[name] = centroid
         capacity_map[name] = supply_capacity
@@ -444,7 +529,7 @@ def _build_default_network(data_dir: Path) -> NetworkConfig:
             ComponentConfig(
                 name=name,
                 category="compressor",
-                hazard_key=name,
+                hazard_key=info.get("hazard_key", name),  # type: ignore[arg-type]
                 area=_estimate_area("compressor", info["supply_capacity"]),  # type: ignore[index]
                 dependencies=info["dependencies"],  # type: ignore[index]
                 capacity=info["supply_capacity"],  # type: ignore[index]
@@ -573,8 +658,10 @@ class TrialEnv(gym.Env):
         self,
         num_nodes: int,
         years: int = 50,
-        weights: Sequence[float] = (0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
+        weights: Optional[Sequence[float]] = None,
         weight_years: Optional[Sequence[int]] = None,
+        weight_schedules: Optional[Mapping[str, Sequence[Sequence[float]]]] = None,
+        dm_scenario: str = "All",
         cost_per_meter: float = 10000.0,
         budget: float = 100000.0,
         year_step: int = 1,
@@ -604,30 +691,64 @@ class TrialEnv(gym.Env):
         self.T = int(years)
         self.budget = float(budget)
         self.year_step = int(year_step)
-        weights_array = np.asarray(weights, dtype=np.float32)
-        if weights_array.ndim == 1:
-            if weights_array.shape[0] != 6:
-                raise ValueError(f"weights must contain 6 entries, received shape {weights_array.shape}.")
-            weights_array = weights_array.reshape(1, -1)
-        elif weights_array.ndim == 2:
-            if weights_array.shape[1] != 6:
-                raise ValueError(
-                    f"Weight schedule must provide 6 entries per step, received shape {weights_array.shape}."
-                )
-        else:
-            raise ValueError("weights must be a 1D sequence of length 6 or a 2D schedule with 6 columns.")
-
-        if np.isnan(weights_array).any():
-            raise ValueError("Weight schedule contains NaN values.")
-
         required_points = ((self.T + self.year_step - 1) // self.year_step) + 1
-        if weights_array.shape[0] < required_points:
-            raise ValueError(
-                f"Weight schedule length {weights_array.shape[0]} insufficient for "
-                f"{self.T} years with step {self.year_step}."
-            )
 
-        self._weight_schedule = weights_array.astype(np.float32)
+        def _prepare_schedule(payload: Sequence[Sequence[float]] | Sequence[float]) -> np.ndarray:
+            arr = np.asarray(payload, dtype=np.float32)
+            if arr.ndim == 1:
+                if arr.shape[0] != 6:
+                    raise ValueError(f"weights must contain 6 entries, received shape {arr.shape}.")
+                arr = arr.reshape(1, -1)
+            elif arr.ndim == 2:
+                if arr.shape[1] != 6:
+                    raise ValueError(
+                        f"Weight schedule must provide 6 entries per step, received shape {arr.shape}."
+                    )
+            else:
+                raise ValueError("weights must be a 1D sequence of length 6 or a 2D schedule with 6 columns.")
+            if np.isnan(arr).any():
+                raise ValueError("Weight schedule contains NaN values.")
+            if arr.shape[0] < required_points:
+                raise ValueError(
+                    f"Weight schedule length {arr.shape[0]} insufficient for "
+                    f"{self.T} years with step {self.year_step}."
+                )
+            subset = np.array(arr[:required_points], dtype=np.float32, copy=True)
+            subset.setflags(write=False)
+            return subset
+
+        self._dm_weight_schedules: Optional[dict[str, np.ndarray]] = None
+        self._dm_scenario_selected: Optional[str] = None
+        self._active_dm_scenario: Optional[str] = None
+
+        if weight_schedules is not None:
+            if not isinstance(weight_schedules, Mapping) or not weight_schedules:
+                raise ValueError("weight_schedules must be a non-empty mapping when provided.")
+            dm_map: dict[str, np.ndarray] = {}
+            for name, schedule_payload in weight_schedules.items():
+                dm_map[str(name)] = _prepare_schedule(schedule_payload)
+            preference = str(dm_scenario).strip() if dm_scenario is not None else ""
+            if not preference:
+                preference = "All"
+            if preference != "All" and preference not in dm_map:
+                available = sorted(dm_map.keys())
+                raise ValueError(
+                    f"dm_scenario '{preference}' not found in available decision-maker scenarios: {available}"
+                )
+            self._dm_weight_schedules = dm_map
+            self._dm_scenario_selected = preference
+            initial_key = preference if preference != "All" else next(iter(dm_map))
+            self._weight_schedule = dm_map[initial_key]
+            self._active_dm_scenario = initial_key if preference != "All" else None
+        else:
+            if weights is None:
+                raise ValueError("Either weights or weight_schedules must be provided.")
+            single_schedule = _prepare_schedule(weights)
+            self._dm_weight_schedules = None
+            self._weight_schedule = single_schedule
+            self._dm_scenario_selected = None
+            self._active_dm_scenario = None
+
         self._current_weight_index = 0
         self.weights = self._weight_schedule[0].copy()
 
@@ -890,20 +1011,24 @@ class TrialEnv(gym.Env):
         action_sizes = np.full(self.N, len(self.height_levels), dtype=np.int64)
         self.action_space = spaces.MultiDiscrete(action_sizes)
 
-        # Observation: [wall_height (N), current_year (1), sea_level_offset (1), econ_impact (1), social_impact (1)]
+        # Observation: [wall_height (N), current_year (1), sea_level_offset (1), dm_weights (6)]
         # Reference scale for normalisation: maximum selectable increment
         self.h_ref = np.full(self.N, self.height_levels[-1], dtype=np.float32)
+        weight_dim = int(self.weights.shape[0])
+        tail_dim = 2 + weight_dim  # year + sea level + decision-maker weights
         if self.normalize_observations:
             # All features scaled to [0,1]
-            low_obs = np.zeros(self.N + 4, dtype=np.float32)
-            high_obs = np.ones(self.N + 4, dtype=np.float32)
+            low_obs = np.zeros(self.N + tail_dim, dtype=np.float32)
+            high_obs = np.ones(self.N + tail_dim, dtype=np.float32)
         else:
             # Raw ranges (year in [0, T]; impacts nonnegative; wall heights unbounded above)
             high_obs = np.array(
-                [1] * self.N + [float(self.T)] + [np.finfo(np.float32).max] * 3,
+                [1] * self.N
+                + [float(self.T)]
+                + [np.finfo(np.float32).max] * (tail_dim - 1),
                 dtype=np.float32,
             )
-            low_obs = np.zeros(self.N + 4, dtype=np.float32)
+            low_obs = np.zeros(self.N + tail_dim, dtype=np.float32)
         self.observation_space = spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
 
         # RNG seed / state
@@ -958,6 +1083,21 @@ class TrialEnv(gym.Env):
             safe_index = max_idx
         self._current_weight_index = safe_index
         self.weights = self._weight_schedule[safe_index]
+
+    def _select_dm_schedule(self) -> None:
+        """Select the active decision-maker preference schedule for the next episode."""
+        if self._dm_weight_schedules is None:
+            return
+        preference = self._dm_scenario_selected or "All"
+        if preference == "All":
+            choices = list(self._dm_weight_schedules.keys())
+            if not choices:
+                raise ValueError("weight_schedules mapping is empty.")
+            scenario_name = str(self.rng.choice(choices))
+        else:
+            scenario_name = preference
+        self._weight_schedule = self._dm_weight_schedules[scenario_name]
+        self._active_dm_scenario = scenario_name
 
     # ------------------------
     # Helper computations
@@ -1302,6 +1442,22 @@ class TrialEnv(gym.Env):
 
     def _obs(self) -> np.ndarray:
         sea_level_offset = float(self._sea_level_offset_for_year(self._year))
+        sea_var = abs(0.02 * sea_level_offset)
+        if sea_var > 0.0:
+            sea_noise = float(self.rng.normal(loc=0.0, scale=sea_var))
+        else:
+            sea_noise = 0.0
+        noisy_sea_offset = max(sea_level_offset + sea_noise, 0.0)
+
+        base_weights = self.weights.astype(np.float32)
+        weight_std = 0.1 * np.abs(base_weights)
+        if base_weights.size:
+            weight_noise = self.rng.normal(loc=0.0, scale=weight_std).astype(np.float32)
+            noisy_weights = base_weights + weight_noise
+        else:
+            noisy_weights = base_weights.copy()
+        noisy_weights = np.clip(noisy_weights, 0.0, None)
+
         if self.normalize_observations:
             # Normalize wall heights by (h_ref * T), clip to [0,1]
             denom = (self.h_ref * self.T).astype(np.float32)
@@ -1309,18 +1465,22 @@ class TrialEnv(gym.Env):
             wh = np.clip(self.wall_height / denom, 0.0, 1.0).astype(np.float32)
             yr = np.float32(self._year / self.T)
             if self.max_depth > 0.0:
-                sea = np.float32(np.clip(sea_level_offset / self.max_depth, 0.0, 1.0))
+                sea = np.float32(np.clip(noisy_sea_offset / self.max_depth, 0.0, 1.0))
             else:
                 sea = np.float32(0.0)
-            econ = np.float32(min(self._econ_impact / 2.0, 1.0))
-            soc = np.float32(min(self._social_impact / 2.0, 1.0))
-            tail = np.array([yr, sea, econ, soc], dtype=np.float32)
-            return np.concatenate([wh, tail])
+            weight_tail = np.clip(noisy_weights, 0.0, 1.0).astype(np.float32)
+            tail = np.concatenate(
+                (np.array([yr, sea], dtype=np.float32), weight_tail),
+            )
+            return np.concatenate([wh, tail]).astype(np.float32)
         else:
-            return np.concatenate([
-                self.wall_height.astype(np.float32),
-                np.array([self._year, sea_level_offset, self._econ_impact, self._social_impact], dtype=np.float32),
-            ])
+            tail = np.concatenate(
+                (
+                    np.array([float(self._year), noisy_sea_offset], dtype=np.float32),
+                    noisy_weights.astype(np.float32),
+                ),
+            )
+            return np.concatenate([self.wall_height.astype(np.float32), tail]).astype(np.float32)
 
     # ------------------------
     # Gym API
@@ -1330,6 +1490,7 @@ class TrialEnv(gym.Env):
         if seed is not None:
             self.np_random, _ = gym.utils.seeding.np_random(seed)
             self.rng = self.np_random
+        self._select_dm_schedule()
         # Start from new
         self.wall_height = self.initial_wall_height.copy()
         self.improvement_height = np.zeros(self.N, dtype=np.float32)
@@ -1351,6 +1512,8 @@ class TrialEnv(gym.Env):
         self._prev_metrics = metrics
         self._prev_loss = self._compute_loss(metrics)
         info = {}
+        if self._active_dm_scenario is not None:
+            info["dm_scenario"] = self._active_dm_scenario
         if self._active_climate_scenario is not None and self._sea_level_offsets is not None:
             info["climate_scenario"] = self._active_climate_scenario
             info["sea_level_offset"] = float(self._sea_level_offsets[0])
@@ -1510,6 +1673,8 @@ class TrialEnv(gym.Env):
             info["gas_social_loss_mean"] = float(breakdown.get("gas_social_mean", 0.0))
             info["elec_social_loss_mean"] = float(breakdown.get("elec_social_mean", 0.0))
         info["repeat_penalty"] = float(repeat_penalty_total)
+        if self._active_dm_scenario is not None:
+            info["dm_scenario"] = self._active_dm_scenario
         if self._active_climate_scenario is not None:
             info["climate_scenario"] = self._active_climate_scenario
             info["sea_level_offset"] = float(self._sea_level_offset_for_year(current_year))

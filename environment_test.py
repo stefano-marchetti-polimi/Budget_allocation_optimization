@@ -417,6 +417,31 @@ def main() -> None:
     env_years = [int(year - base_year) for year in calendar_years]
 
     env = TrialEnv(**TEST_ENV_KWARGS)
+    compressor_set = set(env.compressor_names)
+    gas_generators = [
+        name
+        for name in env.component_names
+        if env.component_categories[name] == "thermal"
+        and any(dep in compressor_set for dep in env.component_dependencies.get(name, ()))
+    ]
+    if len(gas_generators) != len(compressor_set):
+        raise AssertionError(
+            f"Expected one compressor per gas generator, "
+            f"found {len(compressor_set)} compressors and {len(gas_generators)} generators."
+        )
+    compressor_usage: dict[str, str] = {}
+    for generator in gas_generators:
+        deps = tuple(dep for dep in env.component_dependencies.get(generator, ()) if dep in compressor_set)
+        if len(deps) != 1:
+            raise AssertionError(f"Generator '{generator}' should depend on a single dedicated compressor; got {deps}.")
+        compressor = deps[0]
+        if compressor in compressor_usage:
+            raise AssertionError(
+                f"Compressor '{compressor}' is shared by generators "
+                f"'{compressor_usage[compressor]}' and '{generator}'."
+            )
+        compressor_usage[compressor] = generator
+
     env.reset(seed=args.seed)
     payloads, _ = _compute_state_payloads(
         env,
