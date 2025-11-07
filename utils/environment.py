@@ -720,6 +720,13 @@ class TrialEnv(gym.Env):
         self._dm_weight_schedules: Optional[dict[str, np.ndarray]] = None
         self._dm_scenario_selected: Optional[str] = None
         self._active_dm_scenario: Optional[str] = None
+        self._default_dm_schedule_key: Optional[str] = None
+        raw_preference = str(dm_scenario).strip() if dm_scenario is not None else ""
+        preference = raw_preference if raw_preference else "All"
+        random_preference = preference.lower() == "random"
+        if random_preference:
+            preference = "random"
+        self._randomize_dm_weights = random_preference
 
         if weight_schedules is not None:
             if not isinstance(weight_schedules, Mapping) or not weight_schedules:
@@ -727,27 +734,39 @@ class TrialEnv(gym.Env):
             dm_map: dict[str, np.ndarray] = {}
             for name, schedule_payload in weight_schedules.items():
                 dm_map[str(name)] = _prepare_schedule(schedule_payload)
-            preference = str(dm_scenario).strip() if dm_scenario is not None else ""
-            if not preference:
-                preference = "All"
-            if preference != "All" and preference not in dm_map:
+            self._default_dm_schedule_key = next(iter(dm_map))
+            if (
+                not self._randomize_dm_weights
+                and preference != "All"
+                and preference not in dm_map
+            ):
                 available = sorted(dm_map.keys())
                 raise ValueError(
                     f"dm_scenario '{preference}' not found in available decision-maker scenarios: {available}"
                 )
             self._dm_weight_schedules = dm_map
             self._dm_scenario_selected = preference
-            initial_key = preference if preference != "All" else next(iter(dm_map))
+            if not self._randomize_dm_weights and preference != "All":
+                initial_key = preference
+            else:
+                initial_key = self._default_dm_schedule_key
+            if initial_key is None:
+                raise ValueError("Unable to determine an initial decision-maker schedule.")
             self._weight_schedule = dm_map[initial_key]
-            self._active_dm_scenario = initial_key if preference != "All" else None
+            if self._randomize_dm_weights:
+                self._active_dm_scenario = "random"
+            elif preference != "All":
+                self._active_dm_scenario = preference
+            else:
+                self._active_dm_scenario = None
         else:
             if weights is None:
                 raise ValueError("Either weights or weight_schedules must be provided.")
             single_schedule = _prepare_schedule(weights)
             self._dm_weight_schedules = None
             self._weight_schedule = single_schedule
-            self._dm_scenario_selected = None
-            self._active_dm_scenario = None
+            self._dm_scenario_selected = "random" if self._randomize_dm_weights else None
+            self._active_dm_scenario = "random" if self._randomize_dm_weights else None
 
         self._current_weight_index = 0
         self.weights = self._weight_schedule[0].copy()
@@ -1082,11 +1101,42 @@ class TrialEnv(gym.Env):
         elif safe_index > max_idx:
             safe_index = max_idx
         self._current_weight_index = safe_index
-        self.weights = self._weight_schedule[safe_index]
+        if self._randomize_dm_weights:
+            self.weights = self._sample_random_dm_weights()
+        else:
+            self.weights = self._weight_schedule[safe_index]
+
+    def _sample_random_dm_weights(self) -> np.ndarray:
+        """Sample a random decision-maker preference vector with normalized splits."""
+        rng = getattr(self, "rng", None)
+        if rng is None:
+            rng = np.random.default_rng()
+        major_split = rng.dirichlet(np.array([1.0, 1.0], dtype=np.float64))
+        gas_split = rng.dirichlet(np.array([1.0, 1.0], dtype=np.float64))
+        elec_split = rng.dirichlet(np.array([1.0, 1.0], dtype=np.float64))
+        return np.array(
+            [
+                float(major_split[0]),
+                float(major_split[1]),
+                float(gas_split[0]),
+                float(gas_split[1]),
+                float(elec_split[0]),
+                float(elec_split[1]),
+            ],
+            dtype=np.float32,
+        )
 
     def _select_dm_schedule(self) -> None:
         """Select the active decision-maker preference schedule for the next episode."""
         if self._dm_weight_schedules is None:
+            return
+        if self._randomize_dm_weights:
+            scenario_name = "random"
+            reference_key = self._default_dm_schedule_key
+            if reference_key is None:
+                reference_key = next(iter(self._dm_weight_schedules))
+            self._weight_schedule = self._dm_weight_schedules[reference_key]
+            self._active_dm_scenario = scenario_name
             return
         preference = self._dm_scenario_selected or "All"
         if preference == "All":

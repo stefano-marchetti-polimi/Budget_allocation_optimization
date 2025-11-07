@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import tempfile
 from functools import lru_cache
 from itertools import product
 from typing import Callable, Dict, List, Tuple
@@ -26,11 +27,17 @@ BEST_MODEL_FILENAME = "best_model.zip"
 
 # Optional override to force evaluation under a specific decision-maker scenario.
 # Set to None to reuse the scenario defined in `optimization_parallel.py`.
-DM_SCENARIO_OVERRIDE = "gas-economic"
+DM_SCENARIO_OVERRIDE = "electricity-to-gas-economic"
 
 # Optional absolute/relative path to override the training `RESULTS_DIR`.
 # Leave as None to reuse the path from `optimization_parallel.py`.
-RESULTS_DIR_OVERRIDE = "results_All_All"
+RESULTS_DIR_OVERRIDE = "results_random_All"
+
+# Optional alternate DM scenario data sources (CSV or Excel). The first existing file is used.
+DM_SCENARIOS_TEST_FILES = [
+    os.path.join("Decision Makers Preferences", "DM_Scenarios_Test.csv"),
+    os.path.join("Decision Makers Preferences", "DM_Scenarios_Test.xlsx"),
+]
 
 # Set USE_LATEST_CHECKPOINT to True to automatically load the newest checkpoint inside
 # results/checkpoints. Set it to False and provide POLICY_PATH (with or without .zip)
@@ -61,6 +68,7 @@ from optimization_parallel import (
     TrialEnv,
     env_kwargs,
     year_step,
+    load_dm_weight_schedules,
 )
 
 BASE_RESULTS_DIR = RESULTS_DIR
@@ -70,8 +78,78 @@ if RESULTS_DIR_OVERRIDE:
     BEST_MODEL_DIR = os.path.join(RESULTS_DIR, "best_models")
 
 EVAL_ENV_KWARGS = dict(env_kwargs)
+_EVAL_WEIGHT_SCHEDULES = dict(env_kwargs.get("weight_schedules", {}))
+if _EVAL_WEIGHT_SCHEDULES:
+    EVAL_ENV_KWARGS["weight_schedules"] = _EVAL_WEIGHT_SCHEDULES
+
+
+def _load_dm_schedules_from_source(path: str, years: int, step: int):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".csv":
+        return load_dm_weight_schedules(path, years, step)
+    if ext in {".xlsx", ".xls"}:
+        df = pd.read_excel(path)
+        tmp_file = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False)
+        try:
+            df.to_csv(tmp_file.name, index=False)
+            tmp_file.flush()
+            return load_dm_weight_schedules(tmp_file.name, years, step)
+        finally:
+            tmp_file.close()
+            os.unlink(tmp_file.name)
+    raise ValueError(f"Unsupported DM scenario file extension for '{path}'.")
+
+
+def _ensure_dm_scenario_available(scenario: str) -> None:
+    if not scenario:
+        return
+    scenario_clean = scenario.strip()
+    if not scenario_clean or scenario_clean == "All" or scenario_clean.lower() == "random":
+        return
+    if scenario_clean in _EVAL_WEIGHT_SCHEDULES:
+        return
+    source_path = next((p for p in DM_SCENARIOS_TEST_FILES if os.path.exists(p)), None)
+    if source_path is None:
+        raise FileNotFoundError(
+            "DM_Scenarios_Test file not found. Checked: "
+            + ", ".join(DM_SCENARIOS_TEST_FILES)
+        )
+    years_required = int(EVAL_ENV_KWARGS.get("years") or env_kwargs.get("years") or 0)
+    if years_required <= 0:
+        raise ValueError("Invalid 'years' configuration; cannot load DM scenarios.")
+    step_required = int(EVAL_ENV_KWARGS.get("year_step", year_step))
+    schedules, decision_years = _load_dm_schedules_from_source(
+        source_path, years_required, step_required
+    )
+    if scenario_clean not in schedules:
+        available = ", ".join(sorted(schedules.keys()))
+        raise ValueError(
+            f"Scenario '{scenario_clean}' not found in {source_path}. "
+            f"Available: {available}"
+        )
+    _EVAL_WEIGHT_SCHEDULES[scenario_clean] = schedules[scenario_clean]
+    EVAL_ENV_KWARGS["weight_schedules"] = _EVAL_WEIGHT_SCHEDULES
+    current_years = EVAL_ENV_KWARGS.get("weight_years")
+    if current_years is None:
+        EVAL_ENV_KWARGS["weight_years"] = decision_years
+    elif list(current_years) != list(decision_years):
+        raise ValueError(
+            "Decision year grid mismatch between training and DM_Scenarios_Test file."
+        )
+
+
 if DM_SCENARIO_OVERRIDE is not None:
+    _ensure_dm_scenario_available(DM_SCENARIO_OVERRIDE)
     EVAL_ENV_KWARGS["dm_scenario"] = DM_SCENARIO_OVERRIDE
+
+PLOT_SCENARIO_NAME = (
+    DM_SCENARIO_OVERRIDE
+    or EVAL_ENV_KWARGS.get("dm_scenario")
+    or env_kwargs.get("dm_scenario")
+    or "default"
+)
+PLOT_SCENARIO_SAFE = str(PLOT_SCENARIO_NAME).replace(" ", "_").replace("/", "_")
+PLOTS_DIR = os.path.join(RESULTS_DIR, PLOT_SCENARIO_SAFE)
 
 
 @lru_cache(maxsize=1)
@@ -569,6 +647,7 @@ def save_logs(
         return
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(PLOTS_DIR, exist_ok=True)
 
     actions_arr = np.vstack(actions_log)
     action_cols: Dict[str, np.ndarray] = {}
@@ -679,6 +758,24 @@ def save_logs(
         }
     )
 
+    category_map = _component_category_map()
+    gas_assets = [name for name, cat in category_map.items() if cat in {"lng", "compressor"}]
+    elec_assets = [name for name in ASSET_NAMES if name not in gas_assets]
+    gas_cost_cols = [f"cost_{asset}" for asset in gas_assets if f"cost_{asset}" in df.columns]
+    elec_cost_cols = [f"cost_{asset}" for asset in elec_assets if f"cost_{asset}" in df.columns]
+    if gas_cost_cols:
+        df["gas_spend_step"] = df[gas_cost_cols].sum(axis=1)
+        df["gas_cumulative_spend"] = df.groupby("episode")["gas_spend_step"].cumsum()
+    else:
+        df["gas_spend_step"] = 0.0
+        df["gas_cumulative_spend"] = 0.0
+    if elec_cost_cols:
+        df["elec_spend_step"] = df[elec_cost_cols].sum(axis=1)
+        df["elec_cumulative_spend"] = df.groupby("episode")["elec_spend_step"].cumsum()
+    else:
+        df["elec_spend_step"] = 0.0
+        df["elec_cumulative_spend"] = 0.0
+
     multi_episode = df["episode"].nunique() > 1
     years_axis = df["year"].to_numpy()
 
@@ -752,7 +849,7 @@ def save_logs(
     fig.suptitle(title)
     fig.tight_layout()
     fig.subplots_adjust(top=0.95)
-    fig.savefig(os.path.join(RESULTS_DIR, "action_over_time.png"))
+    fig.savefig(os.path.join(PLOTS_DIR, "action_over_time.png"))
     plt.close(fig)
 
     plt.figure(figsize=(10, 4))
@@ -788,7 +885,7 @@ def save_logs(
     plt.legend(loc="best")
     plt.grid(True, axis="both", alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "weights_over_time.png"))
+    plt.savefig(os.path.join(PLOTS_DIR, "weights_over_time.png"))
     plt.close()
 
     # Budget utilisation: cumulative spend vs theoretical budget cap
@@ -843,7 +940,7 @@ def save_logs(
     ax.grid(True, axis="both", alpha=0.3)
     ax.legend(loc="best")
     fig.tight_layout()
-    fig.savefig(os.path.join(RESULTS_DIR, "budget_utilisation.png"))
+    fig.savefig(os.path.join(PLOTS_DIR, "budget_utilisation.png"))
     plt.close(fig)
 
     plt.figure(figsize=(10, 4))
@@ -877,7 +974,7 @@ def save_logs(
     if multi_episode:
         plt.legend(loc="best")
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "unused_budget_over_time.png"))
+    plt.savefig(os.path.join(PLOTS_DIR, "unused_budget_over_time.png"))
     plt.close()
 
     plt.figure(figsize=(10, 4))
@@ -915,7 +1012,7 @@ def save_logs(
     plt.legend(loc="best")
     plt.grid(True, axis="both", alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "cost_over_time.png"))
+    plt.savefig(os.path.join(PLOTS_DIR, "cost_over_time.png"))
     plt.close()
 
     total_cost_per_asset = cost_stack.sum(axis=0)
@@ -927,7 +1024,7 @@ def save_logs(
     plt.title("Total Cost Spent Per Asset")
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "cost_by_asset.png"))
+    plt.savefig(os.path.join(PLOTS_DIR, "cost_by_asset.png"))
     plt.close()
 
     category_map = _component_category_map()
@@ -949,7 +1046,7 @@ def save_logs(
     plt.title("Total Cost by Asset Group")
     plt.xticks(rotation=45, ha="right")
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "cost_by_group.png"))
+    plt.savefig(os.path.join(PLOTS_DIR, "cost_by_group.png"))
     plt.close()
 
     plt.figure(figsize=(10, 4))
@@ -1000,7 +1097,7 @@ def save_logs(
     plt.legend(loc="best")
     plt.grid(True, axis="both", alpha=0.3)
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "impact_over_time.png"))
+    plt.savefig(os.path.join(PLOTS_DIR, "impact_over_time.png"))
     plt.close()
 
     plt.figure(figsize=(10, 4))
@@ -1083,7 +1180,7 @@ def save_logs(
     plt.grid(True, axis="both", alpha=0.3)
     plt.legend(loc="best")
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "reward_decomposition.png"))
+    plt.savefig(os.path.join(PLOTS_DIR, "reward_decomposition.png"))
     plt.close()
 
     # Action heatmap (average action level per asset-year)
@@ -1114,7 +1211,7 @@ def save_logs(
     plt.xlabel("Year")
     plt.title("Action Heatmap (Average Level per Asset-Year)")
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "action_heatmap.png"))
+    plt.savefig(os.path.join(PLOTS_DIR, "action_heatmap.png"))
     plt.close()
 
     if df["sea_level_offset"].notna().any():
@@ -1229,7 +1326,7 @@ def save_logs(
             plt.grid(True, axis="both", alpha=0.3)
             plt.legend(loc="best")
             plt.tight_layout()
-            plt.savefig(os.path.join(RESULTS_DIR, f"expected_depth_vs_height_{file_safe}.png"))
+            plt.savefig(os.path.join(PLOTS_DIR, f"expected_depth_vs_height_{file_safe}.png"))
             plt.close()
 
         # Per-asset cumulative height plot (unchanged)
@@ -1266,8 +1363,131 @@ def save_logs(
         ax.grid(True, axis="both", alpha=0.3)
         ax.legend(loc="best", ncol=2)
         fig.tight_layout()
-        fig.savefig(os.path.join(RESULTS_DIR, "cumulative_height_per_asset.png"))
+        fig.savefig(os.path.join(PLOTS_DIR, "cumulative_height_per_asset.png"))
         plt.close(fig)
+
+    # Cumulative spend by preference group (gas vs electricity)
+    spend_summary = (
+        df.groupby(["episode", "year"])[
+            ["gas_cumulative_spend", "elec_cumulative_spend", "gas_spend_step", "elec_spend_step"]
+        ]
+        .last()
+        .reset_index()
+    )
+    if not spend_summary.empty:
+        spend_stats = (
+            spend_summary.groupby("year")[
+                ["gas_cumulative_spend", "elec_cumulative_spend", "gas_spend_step", "elec_spend_step"]
+            ]
+            .mean()
+            .sort_index()
+        )
+        years_axis_spend = spend_stats.index.to_numpy()
+        gas_series = spend_stats["gas_cumulative_spend"].to_numpy()
+        elec_series = spend_stats["elec_cumulative_spend"].to_numpy()
+        gas_step_series = spend_stats["gas_spend_step"].to_numpy()
+        elec_step_series = spend_stats["elec_spend_step"].to_numpy()
+        fig_spend, ax_spend = plt.subplots(figsize=(12, 4))
+        ax_spend.stackplot(
+            years_axis_spend,
+            gas_series,
+            elec_series,
+            labels=["Gas (LNG + compressors)", "Electricity (others)"],
+            colors=["#1f77b4", "#ff7f0e"],
+            alpha=0.85,
+        )
+        ax_spend.set_xlabel("Year")
+        ax_spend.set_ylabel("Cumulative spend (currency units)")
+        ax_spend.set_title("Cumulative Spend by Decision-Maker Preference Group")
+        ax_spend.grid(True, axis="both", alpha=0.3)
+
+        weight_cols_present = {"weight_W_g", "weight_W_e"}.issubset(df.columns)
+        if weight_cols_present:
+            weight_stats = (
+                df.groupby("year")[["weight_W_g", "weight_W_e"]]
+                .mean()
+                .reindex(years_axis_spend, method="nearest")
+            )
+            ax_weights = ax_spend.twinx()
+            ax_weights.plot(
+                years_axis_spend,
+                weight_stats["weight_W_g"],
+                color="#0d3b66",
+                linestyle="--",
+                linewidth=1.5,
+                label="Weight W_g",
+            )
+            ax_weights.plot(
+                years_axis_spend,
+                weight_stats["weight_W_e"],
+                color="#f95738",
+                linestyle=":",
+                linewidth=1.5,
+                label="Weight W_e",
+            )
+            ax_weights.set_ylabel("DM weight")
+            ax_weights.set_ylim(0.0, 1.05)
+            handles, labels = ax_spend.get_legend_handles_labels()
+            handles_w, labels_w = ax_weights.get_legend_handles_labels()
+            ax_spend.legend(handles + handles_w, labels + labels_w, loc="upper left")
+        else:
+            ax_spend.legend(loc="upper left")
+
+        fig_spend.tight_layout()
+        fig_spend.savefig(os.path.join(PLOTS_DIR, "cumulative_spend_by_group.png"))
+        plt.close(fig_spend)
+
+        diff_series = gas_series - elec_series
+        step_diff_series = gas_step_series - elec_step_series
+        fig_diff, ax_diff = plt.subplots(figsize=(12, 3))
+        ax_diff.axhline(0.0, color="black", linewidth=1.0, linestyle="--", alpha=0.6)
+        for idx in range(len(years_axis_spend) - 1):
+            x0, x1 = years_axis_spend[idx], years_axis_spend[idx + 1]
+            y = diff_series[idx]
+            color = "#1f77b4" if y >= 0 else "#ff7f0e"
+            ax_diff.fill_between(
+                [x0, x1],
+                [0, 0],
+                [y, y],
+                color=color,
+                alpha=0.4,
+                step="post",
+            )
+        ax_diff.step(
+            years_axis_spend,
+            diff_series,
+            where="post",
+            color="#333333",
+            linewidth=1.5,
+            label="Gas - Electricity cumulative spend",
+        )
+        ax_diff.set_xlabel("Year")
+        ax_diff.set_ylabel("Δ cumulative spend (gas - electricity)")
+        ax_diff.set_title("Spend Advantage Over Time")
+        ax_diff.grid(True, axis="y", alpha=0.3)
+        ax_diff.legend(loc="upper left")
+        fig_diff.tight_layout()
+        fig_diff.savefig(os.path.join(PLOTS_DIR, "cumulative_spend_difference.png"))
+        plt.close(fig_diff)
+
+        fig_step_diff, ax_step_diff = plt.subplots(figsize=(12, 3))
+        ax_step_diff.axhline(0.0, color="black", linewidth=1.0, linestyle="--", alpha=0.6)
+        colors = np.where(step_diff_series >= 0, "#1f77b4", "#ff7f0e")
+        ax_step_diff.bar(
+            years_axis_spend,
+            step_diff_series,
+            width=np.diff(np.concatenate([years_axis_spend, [years_axis_spend[-1] + year_step]])),
+            color=colors,
+            alpha=0.6,
+            align="edge",
+        )
+        ax_step_diff.set_xlabel("Year")
+        ax_step_diff.set_ylabel("Gas - Electricity spend (per step)")
+        ax_step_diff.set_title("Instantaneous Spend Difference by Year")
+        ax_step_diff.grid(True, axis="y", alpha=0.3)
+        fig_step_diff.tight_layout()
+        fig_step_diff.savefig(os.path.join(PLOTS_DIR, "step_spend_difference.png"))
+        plt.close(fig_step_diff)
 
     n_assets = actions_arr.shape[1]
     ncols = min(3, n_assets)
@@ -1295,7 +1515,7 @@ def save_logs(
     fig.suptitle("Action Choice Distribution per Asset")
     fig.tight_layout()
     fig.subplots_adjust(top=0.92)
-    fig.savefig(os.path.join(RESULTS_DIR, "action_histogram.png"))
+    fig.savefig(os.path.join(PLOTS_DIR, "action_histogram.png"))
     plt.close(fig)
 
     plt.figure(figsize=(10, 4))
@@ -1322,7 +1542,7 @@ def save_logs(
         reward_title += " (mean ± std)"
     plt.title(reward_title)
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "reward_over_time.png"))
+    plt.savefig(os.path.join(PLOTS_DIR, "reward_over_time.png"))
     plt.close()
 
     if df["sea_level_offset"].notna().any():
@@ -1375,7 +1595,7 @@ def save_logs(
         plt.grid(True, axis="both", alpha=0.3)
         plt.legend(loc="best")
         plt.tight_layout()
-        plt.savefig(os.path.join(RESULTS_DIR, "sea_level_over_time.png"))
+        plt.savefig(os.path.join(PLOTS_DIR, "sea_level_over_time.png"))
         plt.close()
 
     return df
@@ -1557,8 +1777,8 @@ def main() -> None:
             "elec_loss_mean": expert_elec_losses,
         }
     )
-    comparison_path = os.path.join(RESULTS_DIR, "reward_comparison_expert.png")
-    loss_comparison_path = os.path.join(RESULTS_DIR, "loss_comparison_expert.png")
+    comparison_path = os.path.join(PLOTS_DIR, "reward_comparison_expert.png")
+    loss_comparison_path = os.path.join(PLOTS_DIR, "loss_comparison_expert.png")
     if expert_df.empty:
         print("Expert policy produced no steps; skipping reward comparison plot.")
     else:

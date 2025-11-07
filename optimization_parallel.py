@@ -17,7 +17,7 @@ import gymnasium as gym
 from utils.environment import TrialEnv, _build_default_network  # must be importable at top level
 
 # -------------------- User parameters --------------------
-SCENARIO_NAME = "All"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social, All)
+SCENARIO_NAME = "random"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social, All, random)
 CLIMATE_SCENARIO = "All"  # sea level rise projections (SSP1-1.9, SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5, All)
 BUDGET = 500000
 MC_SAMPLES = 1000
@@ -27,7 +27,7 @@ _NETWORK_CONFIG = _build_default_network(PROJECT_ROOT / "data")
 num_nodes = len(_NETWORK_CONFIG.components)
 years = 75 # until 2100
 year_step = 5 # 15 decisions
-RL_steps = 20000000
+RL_steps = 3000000
 learning_rate = 5e-4
 
 # Per-asset footprint areas (m^2)
