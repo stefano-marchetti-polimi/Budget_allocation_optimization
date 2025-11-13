@@ -45,6 +45,9 @@ REPAIR_FUNCTIONS = {
     "lng": LNG_repair_time,
 }
 
+WEIGHT_MIN = 0.2
+WEIGHT_MAX = 0.8
+
 
 @dataclass(frozen=True)
 class ComponentConfig:
@@ -714,6 +717,14 @@ class TrialEnv(gym.Env):
                     f"{self.T} years with step {self.year_step}."
                 )
             subset = np.array(arr[:required_points], dtype=np.float32, copy=True)
+            np.clip(subset, WEIGHT_MIN, WEIGHT_MAX, out=subset)
+            # Enforce complementary structure: electricity = 1 - gas, social = 1 - economic per commodity.
+            subset[:, 0] = np.clip(subset[:, 0], WEIGHT_MIN, WEIGHT_MAX)  # W_g
+            subset[:, 1] = np.clip(1.0 - subset[:, 0], WEIGHT_MIN, WEIGHT_MAX)  # W_e = 1 - W_g
+            subset[:, 2] = np.clip(subset[:, 2], WEIGHT_MIN, WEIGHT_MAX)  # W_ge
+            subset[:, 3] = np.clip(1.0 - subset[:, 2], WEIGHT_MIN, WEIGHT_MAX)  # W_gs = 1 - W_ge
+            subset[:, 4] = np.clip(subset[:, 4], WEIGHT_MIN, WEIGHT_MAX)  # W_ee
+            subset[:, 5] = np.clip(1.0 - subset[:, 4], WEIGHT_MIN, WEIGHT_MAX)  # W_es = 1 - W_ee
             subset.setflags(write=False)
             return subset
 
@@ -1111,17 +1122,27 @@ class TrialEnv(gym.Env):
         rng = getattr(self, "rng", None)
         if rng is None:
             rng = np.random.default_rng()
-        major_split = rng.dirichlet(np.array([1.0, 1.0], dtype=np.float64))
-        gas_split = rng.dirichlet(np.array([1.0, 1.0], dtype=np.float64))
-        elec_split = rng.dirichlet(np.array([1.0, 1.0], dtype=np.float64))
+
+        lower_bound = max(WEIGHT_MIN, 1.0 - WEIGHT_MAX)
+        upper_bound = min(WEIGHT_MAX, 1.0 - WEIGHT_MIN)
+        if lower_bound > upper_bound:
+            raise ValueError("Invalid preference bounds; cannot sample bounded splits.")
+
+        def _bounded_pair() -> tuple[float, float]:
+            primary = float(rng.uniform(lower_bound, upper_bound))
+            return primary, 1.0 - primary
+
+        w_gas, w_electricity = _bounded_pair()
+        w_gas_loss, w_gas_social = _bounded_pair()
+        w_elec_loss, w_elec_social = _bounded_pair()
         return np.array(
             [
-                float(major_split[0]),
-                float(major_split[1]),
-                float(gas_split[0]),
-                float(gas_split[1]),
-                float(elec_split[0]),
-                float(elec_split[1]),
+                np.clip(w_gas, WEIGHT_MIN, WEIGHT_MAX),
+                np.clip(w_electricity, WEIGHT_MIN, WEIGHT_MAX),
+                np.clip(w_gas_loss, WEIGHT_MIN, WEIGHT_MAX),
+                np.clip(w_gas_social, WEIGHT_MIN, WEIGHT_MAX),
+                np.clip(w_elec_loss, WEIGHT_MIN, WEIGHT_MAX),
+                np.clip(w_elec_social, WEIGHT_MIN, WEIGHT_MAX),
             ],
             dtype=np.float32,
         )
