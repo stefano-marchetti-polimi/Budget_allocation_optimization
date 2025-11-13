@@ -1,8 +1,14 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from typing import Mapping, Optional, Sequence
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+import zipfile
+import xml.etree.ElementTree as ET
 import pandas as pd
+import math
 from utils.fragility_curves import (
     fragility_PV,
     fragility_substation,
@@ -10,8 +16,632 @@ from utils.fragility_curves import (
     fragility_thermal_unit,
     fragility_LNG_terminal,
 )
-from utils.repair_times import (compressor_repair_time, substation_repair_time, thermal_unit_repair_time, pv_repair_time, LNG_repair_time)
+from utils.repair_times import (
+    compressor_repair_time,
+    substation_repair_time,
+    thermal_unit_repair_time,
+    pv_repair_time,
+    LNG_repair_time,
+)
 from utils.copula_sampler import sample_flood
+
+EXCEL_NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+EXCEL_NS_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+ASSET_COORD_CRS = "EPSG:32615"
+
+FRAGILITY_FUNCTIONS = {
+    "renewable": fragility_PV,
+    "thermal": fragility_thermal_unit,
+    "compressor": fragility_compressor,
+    "substation": fragility_substation,
+    "lng": fragility_LNG_terminal,
+}
+
+REPAIR_FUNCTIONS = {
+    "renewable": pv_repair_time,
+    "thermal": thermal_unit_repair_time,
+    "compressor": compressor_repair_time,
+    "substation": substation_repair_time,
+    "lng": LNG_repair_time,
+}
+
+WEIGHT_MIN = 0.2
+WEIGHT_MAX = 0.8
+
+
+@dataclass(frozen=True)
+class ComponentConfig:
+    name: str
+    category: str
+    hazard_key: str
+    area: float
+    dependencies: Tuple[str, ...] = ()
+    generator_sources: Tuple[str, ...] = ()
+    capacity: float = 0.0
+    population: float = 0.0
+    coordinate: Optional[Tuple[float, float]] = None
+    upgradable: bool = True
+    can_fail: bool = True
+    industrial_load: float = 0.0
+    residential_load: float = 0.0
+
+
+@dataclass(frozen=True)
+class NetworkConfig:
+    components: Tuple[ComponentConfig, ...]
+    compressor_supply: Dict[str, float]
+    compressor_people: Dict[str, float]
+    substation_supply: Dict[str, float]
+    substation_people: Dict[str, float]
+    compressor_industrial: Dict[str, float]
+    substation_industrial: Dict[str, float]
+    compressor_residential: Dict[str, float]
+    substation_residential: Dict[str, float]
+    county_coordinates: Dict[str, Tuple[float, float]]
+    county_population: Dict[str, float]
+    asset_counties: Dict[str, Tuple[str, ...]]
+    county_display_names: Dict[str, str]
+
+
+def _format_component_name(raw: str) -> str:
+    cleaned = " ".join(str(raw).strip().split())
+    for token in ["'", ".", ","]:
+        cleaned = cleaned.replace(token, "")
+    cleaned = cleaned.replace("-", " ").replace("/", " ")
+    parts = [part for part in cleaned.split() if part]
+    return "_".join(parts)
+
+
+def _parse_cell_value(cell, shared_strings: Dict[int, str]):
+    value_tag = cell.find(f"{{{EXCEL_NS_MAIN}}}v")
+    if value_tag is None:
+        return None
+    raw = value_tag.text
+    if cell.attrib.get("t") == "s":
+        try:
+            return shared_strings.get(int(raw), "")
+        except (TypeError, ValueError):
+            return ""
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return raw
+    if val.is_integer():
+        return int(val)
+    return val
+
+
+def _read_excel_sheet(path: Path, sheet_name: str) -> List[Dict[str, object]]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Excel file not found: {path}")
+
+    with zipfile.ZipFile(path) as z:
+        shared_strings: Dict[int, str] = {}
+        shared_path = "xl/sharedStrings.xml"
+        if shared_path in z.namelist():
+            root = ET.fromstring(z.read(shared_path))
+            strings: List[str] = []
+            for si in root.findall(f"{{{EXCEL_NS_MAIN}}}si"):
+                text_fragments = [t.text or "" for t in si.findall(f".//{{{EXCEL_NS_MAIN}}}t")]
+                strings.append("".join(text_fragments))
+            shared_strings = {idx: text for idx, text in enumerate(strings)}
+
+        workbook = ET.fromstring(z.read("xl/workbook.xml"))
+        rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+        rel_map = {
+            rel.attrib["Id"]: rel.attrib["Target"]
+            for rel in rels.findall(f"{{{EXCEL_NS_REL}}}Relationship")
+        }
+
+        target_rel = None
+        for sheet in workbook.findall(f"{{{EXCEL_NS_MAIN}}}sheets/{{{EXCEL_NS_MAIN}}}sheet"):
+            if sheet.attrib.get("name") == sheet_name:
+                rel_id = sheet.attrib['{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id']
+                target_rel = rel_map.get(rel_id)
+                break
+        if target_rel is None:
+            available = [sheet.attrib.get("name") for sheet in workbook.findall(f"{{{EXCEL_NS_MAIN}}}sheets/{{{EXCEL_NS_MAIN}}}sheet")]
+            raise ValueError(f"Sheet '{sheet_name}' not found in {path.name}. Available sheets: {available}")
+
+        sheet_xml = ET.fromstring(z.read(f"xl/{target_rel}"))
+
+    rows: List[Dict[str, object]] = []
+    header_map: Dict[str, str] = {}
+    for row in sheet_xml.findall(f"{{{EXCEL_NS_MAIN}}}sheetData/{{{EXCEL_NS_MAIN}}}row"):
+        row_idx = int(row.attrib.get("r", "0"))
+        cells = {}
+        for cell in row.findall(f"{{{EXCEL_NS_MAIN}}}c"):
+            ref = cell.attrib.get("r", "")
+            column = "".join([ch for ch in ref if ch.isalpha()])
+            if not column:
+                continue
+            value = _parse_cell_value(cell, shared_strings)
+            if value is None:
+                continue
+            cells[column] = value
+        if not cells:
+            continue
+        if row_idx == 1:
+            header_map = {
+                column: str(value).strip()
+                for column, value in cells.items()
+                if str(value).strip()
+            }
+            continue
+        if not header_map:
+            continue
+        row_data: Dict[str, object] = {}
+        for column, header in header_map.items():
+            if column not in cells:
+                continue
+            row_data[header] = cells[column]
+        if row_data:
+            rows.append(row_data)
+    return rows
+
+
+def _estimate_area(category: str, capacity: float = 0.0, population: float = 0.0) -> float:
+    base_defaults = {
+        "lng": 320.0,
+        "compressor": 180.0,
+        "thermal": 260.0,
+        "renewable": 210.0,
+        "substation": 190.0,
+    }
+    scale_defaults = {
+        "lng": 4.5,
+        "compressor": 3.0,
+        "thermal": 5.0,
+        "renewable": 4.0,
+        "substation": 3.5,
+    }
+    base = base_defaults.get(category, 200.0)
+    scale = scale_defaults.get(category, 3.0)
+    proxy = capacity if category not in {"substation", "compressor"} else max(population, capacity)
+    return float(base + scale * np.sqrt(max(proxy, 1.0)))
+
+
+@lru_cache(maxsize=1)
+def _build_default_network(data_dir: Path) -> NetworkConfig:
+    data_dir = Path(data_dir)
+    asset_path = data_dir / "Assets Catalog filtered.xlsx"
+    population_path = data_dir / "County_Population_ver2.xlsx"
+
+    electric_rows = _read_excel_sheet(asset_path, "Electric Network")
+    gas_rows = _read_excel_sheet(asset_path, "Gas Network")
+    population_rows = _read_excel_sheet(population_path, "Sheet1")
+
+    electric_map: Dict[str, Dict[str, object]] = {}
+    for row in electric_rows:
+        name = row.get("Name")
+        power = row.get("Power (MWe)")
+        if not name or power in (None, ""):
+            continue
+        electric_map[_format_component_name(name)] = row
+
+    gas_map: Dict[str, Dict[str, object]] = {}
+    for row in gas_rows:
+        name = row.get("Name")
+        power = row.get("Power (MWe)")
+        if not name or power in (None, ""):
+            continue
+        gas_map[_format_component_name(name)] = row
+
+    population_map: Dict[str, float] = {}
+    industrial_population_map: Dict[str, float] = {}
+    residential_population_map: Dict[str, float] = {}
+    county_coordinates: Dict[str, Tuple[float, float]] = {}
+    county_population: Dict[str, float] = {}
+    county_display_names: Dict[str, str] = {}
+    for row in population_rows:
+        county = row.get("County")
+        pop = row.get("Population Size")
+        if not county or not isinstance(pop, (int, float)):
+            continue
+        key = _format_component_name(county)
+        total_pop = float(pop)
+        population_map[key] = total_pop
+        county_display_names[key] = str(county)
+        county_population[key] = total_pop
+
+        east = row.get("UTM Easting")
+        north = row.get("UTM Northing")
+        if east not in (None, "") and north not in (None, ""):
+            try:
+                easting_val = float(east)
+                northing_val = float(north)
+            except (TypeError, ValueError):
+                easting_val = northing_val = None
+            else:
+                if np.isfinite(easting_val) and np.isfinite(northing_val):
+                    county_coordinates[key] = (easting_val, northing_val)
+
+        def _fraction(value: object) -> float:
+            if value in (None, "", "NA"):
+                return 0.0
+            try:
+                frac = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Invalid fraction value '{value}' for county '{county}' in {population_path.name}"
+                )
+            if not np.isfinite(frac):
+                return 0.0
+            return float(np.clip(frac, 0.0, 1.0))
+
+        industrial_share = _fraction(row.get("Industrial (%)"))
+        residential_share = _fraction(row.get("Residential (%)"))
+        industrial_population_map[key] = total_pop * industrial_share
+        residential_population_map[key] = total_pop * residential_share
+
+    def _row_coordinate(row: Mapping[str, object]) -> Tuple[float, float]:
+        east = row.get("Easting (m)")
+        north = row.get("Northing (m)")
+        if east is None or north is None:
+            raise KeyError("Easting/Northing columns missing in asset catalog row.")
+        return float(east), float(north)
+
+    def capacity_from_row(row: Dict[str, object]) -> float:
+        value = row.get("Power (MWe)")
+        if value is None:
+            return 0.0
+        return float(value)
+
+    components: List[ComponentConfig] = []
+    capacity_map: Dict[str, float] = {}
+    coordinate_map: Dict[str, Tuple[float, float]] = {}
+
+    def _weighted_centroid(asset_names: Sequence[str]) -> Optional[Tuple[float, float]]:
+        coords: List[Tuple[float, float]] = []
+        weights: List[float] = []
+        for asset in asset_names:
+            coord = coordinate_map.get(asset)
+            if coord is None:
+                continue
+            coords.append(coord)
+            weights.append(float(capacity_map.get(asset, 1.0)))
+        if not coords:
+            return None
+        total_weight = float(sum(weights))
+        if total_weight <= 0.0:
+            total_weight = float(len(coords))
+            weights = [1.0] * len(coords)
+        centroid_x = sum(c[0] * w for c, w in zip(coords, weights)) / total_weight
+        centroid_y = sum(c[1] * w for c, w in zip(coords, weights)) / total_weight
+        return (centroid_x, centroid_y)
+
+    # LNG terminal (treated as source for gas network)
+    lng_row = gas_map.get("Calcasieu_Pass_2")
+    if lng_row is None:
+        raise KeyError("'Calcasieu Pass 2' entry missing from gas asset catalog")
+    lng_capacity = capacity_from_row(lng_row)
+    lng_coord = _row_coordinate(lng_row)
+    components.append(
+        ComponentConfig(
+            name="Calcasieu_Pass_LNG",
+            category="lng",
+            hazard_key="Calcasieu_Pass_LNG",
+            area=_estimate_area("lng", lng_capacity),
+            capacity=lng_capacity,
+            coordinate=lng_coord,
+        )
+    )
+    capacity_map["Calcasieu_Pass_LNG"] = lng_capacity
+    coordinate_map["Calcasieu_Pass_LNG"] = lng_coord
+
+    # Renewable and non-gas generation units
+    generation_defs = [
+        {"name": "Roy_S_Nelson_Coal", "source": ("electric", "Roy_S_Nelson"), "category": "thermal", "dependencies": ()},
+        {"name": "Cottonwood_Bayou_Solar", "source": ("electric", "Cottonwood_Bayou"), "category": "renewable"},
+        {"name": "Galveston_1_Wind", "source": ("electric", "Galveston_1"), "category": "renewable"},
+        {"name": "Galveston_2_Wind", "source": ("electric", "Galveston_2"), "category": "renewable"},
+        {"name": "Lake_Charles_Wind", "source": ("electric", "Lake_Charles"), "category": "renewable"},
+        {"name": "Liberty_1_Solar", "source": ("electric", "Liberty_1"), "category": "renewable"},
+        {"name": "Trinity_River_Solar", "source": ("electric", "Trinity_river_solar"), "category": "renewable"},
+        {"name": "Myrtle_Solar", "source": ("electric", "Myrtle_solar"), "category": "renewable"},
+        {"name": "Red_Bluff_Road_Solar", "source": ("electric", "Red_Bluff_Road_Solar"), "category": "renewable"},
+        {"name": "Brazoria_West_Solar", "source": ("electric", "Brazoria_West"), "category": "renewable"},
+    ]
+
+    def _compressor_name(asset_name: str) -> str:
+        return f"Comp_{asset_name}"
+
+    LNG_DEPENDENCY = ("Calcasieu_Pass_LNG",)
+
+    thermal_defs = [
+        {
+            "name": "Sabine_CCGT",
+            "source": ("gas", "Sabine"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Sabine_CCGT"),),
+            "compressor": _compressor_name("Sabine_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Sabine_CCGT"),
+        },
+        {
+            "name": "Port_Arthur_CCGT",
+            "source": ("gas", "Porth_Arthur"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Port_Arthur_CCGT"),),
+            "compressor": _compressor_name("Port_Arthur_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Port_Arthur_CCGT"),
+        },
+        {
+            "name": "Lake_Charles_CCGT",
+            "source": ("gas", "Lake_Charles"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Lake_Charles_CCGT"),),
+            "compressor": _compressor_name("Lake_Charles_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Lake_Charles_CCGT"),
+        },
+        {
+            "name": "Cottonwood_Gas",
+            "source": ("gas", "Cottonwood"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Cottonwood_Gas"),),
+            "compressor": _compressor_name("Cottonwood_Gas"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Cottonwood_Gas"),
+        },
+        {
+            "name": "Cedar_Bayou_CCGT",
+            "source": ("gas", "Cedar_Bayou"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Cedar_Bayou_CCGT"),),
+            "compressor": _compressor_name("Cedar_Bayou_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Cedar_Bayou_CCGT"),
+        },
+        {
+            "name": "Channelview_CCGT",
+            "source": ("gas", "Channelview"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Channelview_CCGT"),),
+            "compressor": _compressor_name("Channelview_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Channelview_CCGT"),
+        },
+        {
+            "name": "Bacliff_CCGT",
+            "source": ("gas", "Bacliff"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Bacliff_CCGT"),),
+            "compressor": _compressor_name("Bacliff_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Bacliff_CCGT"),
+        },
+        {
+            "name": "Galveston_CCGT",
+            "source": ("gas", "Galveston"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Galveston_CCGT"),),
+            "compressor": _compressor_name("Galveston_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Galveston_CCGT"),
+        },
+        {
+            "name": "Freeport_CCGT",
+            "source": ("gas", "Free_Port"),
+            "category": "thermal",
+            "dependencies": (_compressor_name("Freeport_CCGT"),),
+            "compressor": _compressor_name("Freeport_CCGT"),
+            "compressor_dependencies": LNG_DEPENDENCY,
+            "compressor_hazard_key": _compressor_name("Freeport_CCGT"),
+        },
+    ]
+
+    offshore_wind_assets = {"Galveston_1_Wind", "Galveston_2_Wind", "Lake_Charles_Wind"}
+
+    for spec in generation_defs + thermal_defs:
+        source_type, source_key = spec["source"]
+        data_map = electric_map if source_type == "electric" else gas_map
+        row = data_map.get(source_key)
+        if row is None:
+            raise KeyError(f"Asset '{source_key}' not found in {source_type} catalog")
+        capacity = capacity_from_row(row)
+        area = _estimate_area(spec["category"], capacity)
+        coord = _row_coordinate(row)
+        is_offshore_wind = spec["name"] in offshore_wind_assets
+        components.append(
+            ComponentConfig(
+                name=spec["name"],
+                category=spec["category"],
+                hazard_key=spec["name"],
+                area=area,
+                dependencies=tuple(spec.get("dependencies", ())),
+                capacity=capacity,
+                coordinate=coord,
+                upgradable=not is_offshore_wind,
+                can_fail=not is_offshore_wind,
+            )
+        )
+        capacity_map[spec["name"]] = capacity
+        coordinate_map[spec["name"]] = coord
+
+    compressor_specs: Dict[str, Dict[str, object]] = {}
+    for spec in thermal_defs:
+        comp_name = spec.get("compressor")
+        if not comp_name:
+            continue
+        if comp_name in compressor_specs:
+            raise ValueError(f"Duplicate compressor definition for '{comp_name}'.")
+        feed_assets = (spec["name"],)
+        dependencies = tuple(spec.get("compressor_dependencies", LNG_DEPENDENCY))
+        hazard_key = spec.get("compressor_hazard_key")
+        if hazard_key is None:
+            hazard_key = feed_assets[0]
+        compressor_specs[comp_name] = {
+            "feed_assets": feed_assets,
+            "dependencies": dependencies,
+            "hazard_key": hazard_key,
+        }
+
+    def _distance(pt_a: Tuple[float, float], pt_b: Tuple[float, float]) -> float:
+        return math.hypot(pt_a[0] - pt_b[0], pt_a[1] - pt_b[1])
+
+    asset_counties: Dict[str, Tuple[str, ...]] = {}
+
+    compressor_info: Dict[str, Dict[str, object]] = {}
+    for name, spec in compressor_specs.items():
+        feed_assets = tuple(spec.get("feed_assets", ()))
+        if not feed_assets:
+            raise ValueError(f"Compressor '{name}' does not reference any feed assets.")
+        supply_capacity = sum(capacity_map.get(asset, 0.0) for asset in feed_assets)
+        centroid = _weighted_centroid(feed_assets)
+        if centroid is None:
+            first_feed = feed_assets[0]
+            centroid = coordinate_map.get(first_feed, coordinate_map.get("Calcasieu_Pass_LNG"))
+        if centroid is None:
+            raise ValueError(f"Cannot determine coordinate for compressor '{name}'.")
+        compressor_info[name] = {
+            "coordinate": centroid,
+            "dependencies": tuple(spec.get("dependencies", ())),
+            "supply_capacity": supply_capacity,
+            "hazard_key": spec.get("hazard_key", name),
+        }
+        coordinate_map[name] = centroid
+        capacity_map[name] = supply_capacity
+
+    compressor_counties: Dict[str, List[str]] = {name: [] for name in compressor_info}
+    for county_key, coord in county_coordinates.items():
+        if coord is None:
+            continue
+        best_name = min(
+            compressor_info,
+            key=lambda comp: _distance(coord, compressor_info[comp]["coordinate"]),  # type: ignore[index]
+        )
+        compressor_counties[best_name].append(county_key)
+
+    compressor_industrial_load: Dict[str, float] = {}
+    compressor_residential_load: Dict[str, float] = {}
+    compressor_people: Dict[str, float] = {}
+    compressor_supply: Dict[str, float] = {}
+    for name, info in compressor_info.items():
+        assigned_counties = compressor_counties.get(name, [])
+        industrial_load = sum(industrial_population_map.get(county, 0.0) for county in assigned_counties)
+        residential_load = sum(residential_population_map.get(county, 0.0) for county in assigned_counties)
+        population_total = sum(population_map.get(county, 0.0) for county in assigned_counties)
+        compressor_industrial_load[name] = industrial_load
+        compressor_residential_load[name] = residential_load
+        compressor_people[name] = population_total
+        compressor_supply[name] = info["supply_capacity"]  # type: ignore[index]
+        components.append(
+            ComponentConfig(
+                name=name,
+                category="compressor",
+                hazard_key=info.get("hazard_key", name),  # type: ignore[arg-type]
+                area=_estimate_area("compressor", info["supply_capacity"]),  # type: ignore[index]
+                dependencies=info["dependencies"],  # type: ignore[index]
+                capacity=info["supply_capacity"],  # type: ignore[index]
+                coordinate=info["coordinate"],  # type: ignore[index]
+                upgradable=True,
+                can_fail=True,
+                industrial_load=industrial_load,
+                residential_load=residential_load,
+            )
+        )
+        asset_counties[name] = tuple(assigned_counties)
+
+    generator_assets = [
+        spec["name"]
+        for spec in generation_defs + thermal_defs
+        if spec["category"] in {"renewable", "thermal"}
+    ]
+
+    def _offset_substation(county_key: str, base_coord: Tuple[float, float], distance: float = 4_500.0) -> Tuple[float, float]:
+        angle = (abs(hash(("substation", county_key))) % 3600) / 3600.0 * 2.0 * math.pi
+        return (
+            base_coord[0] + distance * math.cos(angle),
+            base_coord[1] + distance * math.sin(angle),
+        )
+
+    substation_people: Dict[str, float] = {}
+    substation_industrial_load: Dict[str, float] = {}
+    substation_residential_load: Dict[str, float] = {}
+    substation_supply: Dict[str, float] = {}
+    substation_info: Dict[str, Dict[str, object]] = {}
+
+    for county_key, coord in county_coordinates.items():
+        if coord is None or not generator_assets:
+            continue
+        nearest_generator = min(
+            generator_assets,
+            key=lambda gen: _distance(coord, coordinate_map[gen]),
+        )
+        substation_name = f"Sub_{county_key}"
+        substation_coord = _offset_substation(county_key, coord)
+        population_total = population_map.get(county_key, 0.0)
+        industrial_load = industrial_population_map.get(county_key, 0.0)
+        residential_load = residential_population_map.get(county_key, 0.0)
+        substation_info[substation_name] = {
+            "coordinate": substation_coord,
+            "generators": {nearest_generator},
+            "population": population_total,
+            "industrial": industrial_load,
+            "residential": residential_load,
+            "counties": (county_key,),
+        }
+
+    # Ensure every generator feeds at least one substation by attaching missing generators to nearest substation
+    generator_assignments: Dict[str, str] = {}
+    for sub_name, info in substation_info.items():
+        for gen in info["generators"]:
+            generator_assignments[gen] = sub_name  # type: ignore[index]
+    for generator in generator_assets:
+        if generator not in generator_assignments and generator in coordinate_map:
+            best_substation = min(
+                substation_info.keys(),
+                key=lambda sub: _distance(coordinate_map[generator], substation_info[sub]["coordinate"]),  # type: ignore[index]
+            )
+            substation_info[best_substation]["generators"].add(generator)  # type: ignore[index]
+
+    for substation_name, info in substation_info.items():
+        coord = info["coordinate"]  # type: ignore[assignment]
+        generators = sorted(info["generators"])  # type: ignore[index]
+        population_total = float(info["population"])  # type: ignore[index]
+        industrial_load = float(info["industrial"])  # type: ignore[index]
+        residential_load = float(info["residential"])  # type: ignore[index]
+        capacity = float(sum(capacity_map.get(gen, 0.0) for gen in generators))
+        components.append(
+            ComponentConfig(
+                name=substation_name,
+                category="substation",
+                hazard_key=substation_name,
+                area=_estimate_area("substation", capacity, population_total),
+                generator_sources=tuple(generators),
+                population=population_total,
+                capacity=capacity,
+                coordinate=coord,
+                industrial_load=industrial_load,
+                residential_load=residential_load,
+            )
+        )
+        coordinate_map[substation_name] = coord  # type: ignore[assignment]
+        capacity_map[substation_name] = capacity
+        substation_people[substation_name] = population_total
+        substation_industrial_load[substation_name] = industrial_load
+        substation_residential_load[substation_name] = residential_load
+        substation_supply[substation_name] = capacity
+        asset_counties[substation_name] = tuple(info["counties"])  # type: ignore[index]
+
+    return NetworkConfig(
+        components=tuple(components),
+        compressor_supply=compressor_supply,
+        compressor_people=compressor_people,
+        substation_supply=substation_supply,
+        substation_people=substation_people,
+        compressor_industrial=compressor_industrial_load,
+        substation_industrial=substation_industrial_load,
+        compressor_residential=compressor_residential_load,
+        substation_residential=substation_residential_load,
+        county_coordinates=county_coordinates,
+        county_population=county_population,
+        asset_counties=asset_counties,
+        county_display_names=county_display_names,
+    )
 
 class TrialEnv(gym.Env):
     """
@@ -31,8 +661,10 @@ class TrialEnv(gym.Env):
         self,
         num_nodes: int,
         years: int = 50,
-        weights: Sequence[float] = (0.5, 0.5, 0.5, 0.5, 0.5, 0.5),
+        weights: Optional[Sequence[float]] = None,
         weight_years: Optional[Sequence[int]] = None,
+        weight_schedules: Optional[Mapping[str, Sequence[Sequence[float]]]] = None,
+        dm_scenario: str = "All",
         cost_per_meter: float = 10000.0,
         budget: float = 100000.0,
         year_step: int = 1,
@@ -50,9 +682,10 @@ class TrialEnv(gym.Env):
         climate_scenario: str = "All",
         normalize_observations: bool = True,
         maximum_repair_time: float = 40.75,
-        repeat_asset_penalty: float = -0.25,
-        reward_scale: float = 12000.0,
-        cost_weight: float = 0.4,
+        repeat_asset_penalty: float = -0.1,
+        reward_scale: float = 60000.0,
+        cost_weight: float = 0.08,
+        industrial_weight: float = 0.6,
     ):
         super().__init__()
         assert num_nodes >= 1, "num_nodes must be >= 1"
@@ -61,30 +694,91 @@ class TrialEnv(gym.Env):
         self.T = int(years)
         self.budget = float(budget)
         self.year_step = int(year_step)
-        weights_array = np.asarray(weights, dtype=np.float32)
-        if weights_array.ndim == 1:
-            if weights_array.shape[0] != 6:
-                raise ValueError(f"weights must contain 6 entries, received shape {weights_array.shape}.")
-            weights_array = weights_array.reshape(1, -1)
-        elif weights_array.ndim == 2:
-            if weights_array.shape[1] != 6:
-                raise ValueError(
-                    f"Weight schedule must provide 6 entries per step, received shape {weights_array.shape}."
-                )
-        else:
-            raise ValueError("weights must be a 1D sequence of length 6 or a 2D schedule with 6 columns.")
-
-        if np.isnan(weights_array).any():
-            raise ValueError("Weight schedule contains NaN values.")
-
         required_points = ((self.T + self.year_step - 1) // self.year_step) + 1
-        if weights_array.shape[0] < required_points:
-            raise ValueError(
-                f"Weight schedule length {weights_array.shape[0]} insufficient for "
-                f"{self.T} years with step {self.year_step}."
-            )
 
-        self._weight_schedule = weights_array.astype(np.float32)
+        def _prepare_schedule(payload: Sequence[Sequence[float]] | Sequence[float]) -> np.ndarray:
+            arr = np.asarray(payload, dtype=np.float32)
+            if arr.ndim == 1:
+                if arr.shape[0] != 6:
+                    raise ValueError(f"weights must contain 6 entries, received shape {arr.shape}.")
+                arr = arr.reshape(1, -1)
+            elif arr.ndim == 2:
+                if arr.shape[1] != 6:
+                    raise ValueError(
+                        f"Weight schedule must provide 6 entries per step, received shape {arr.shape}."
+                    )
+            else:
+                raise ValueError("weights must be a 1D sequence of length 6 or a 2D schedule with 6 columns.")
+            if np.isnan(arr).any():
+                raise ValueError("Weight schedule contains NaN values.")
+            if arr.shape[0] < required_points:
+                raise ValueError(
+                    f"Weight schedule length {arr.shape[0]} insufficient for "
+                    f"{self.T} years with step {self.year_step}."
+                )
+            subset = np.array(arr[:required_points], dtype=np.float32, copy=True)
+            np.clip(subset, WEIGHT_MIN, WEIGHT_MAX, out=subset)
+            # Enforce complementary structure: electricity = 1 - gas, social = 1 - economic per commodity.
+            subset[:, 0] = np.clip(subset[:, 0], WEIGHT_MIN, WEIGHT_MAX)  # W_g
+            subset[:, 1] = np.clip(1.0 - subset[:, 0], WEIGHT_MIN, WEIGHT_MAX)  # W_e = 1 - W_g
+            subset[:, 2] = np.clip(subset[:, 2], WEIGHT_MIN, WEIGHT_MAX)  # W_ge
+            subset[:, 3] = np.clip(1.0 - subset[:, 2], WEIGHT_MIN, WEIGHT_MAX)  # W_gs = 1 - W_ge
+            subset[:, 4] = np.clip(subset[:, 4], WEIGHT_MIN, WEIGHT_MAX)  # W_ee
+            subset[:, 5] = np.clip(1.0 - subset[:, 4], WEIGHT_MIN, WEIGHT_MAX)  # W_es = 1 - W_ee
+            subset.setflags(write=False)
+            return subset
+
+        self._dm_weight_schedules: Optional[dict[str, np.ndarray]] = None
+        self._dm_scenario_selected: Optional[str] = None
+        self._active_dm_scenario: Optional[str] = None
+        self._default_dm_schedule_key: Optional[str] = None
+        raw_preference = str(dm_scenario).strip() if dm_scenario is not None else ""
+        preference = raw_preference if raw_preference else "All"
+        random_preference = preference.lower() == "random"
+        if random_preference:
+            preference = "random"
+        self._randomize_dm_weights = random_preference
+
+        if weight_schedules is not None:
+            if not isinstance(weight_schedules, Mapping) or not weight_schedules:
+                raise ValueError("weight_schedules must be a non-empty mapping when provided.")
+            dm_map: dict[str, np.ndarray] = {}
+            for name, schedule_payload in weight_schedules.items():
+                dm_map[str(name)] = _prepare_schedule(schedule_payload)
+            self._default_dm_schedule_key = next(iter(dm_map))
+            if (
+                not self._randomize_dm_weights
+                and preference != "All"
+                and preference not in dm_map
+            ):
+                available = sorted(dm_map.keys())
+                raise ValueError(
+                    f"dm_scenario '{preference}' not found in available decision-maker scenarios: {available}"
+                )
+            self._dm_weight_schedules = dm_map
+            self._dm_scenario_selected = preference
+            if not self._randomize_dm_weights and preference != "All":
+                initial_key = preference
+            else:
+                initial_key = self._default_dm_schedule_key
+            if initial_key is None:
+                raise ValueError("Unable to determine an initial decision-maker schedule.")
+            self._weight_schedule = dm_map[initial_key]
+            if self._randomize_dm_weights:
+                self._active_dm_scenario = "random"
+            elif preference != "All":
+                self._active_dm_scenario = preference
+            else:
+                self._active_dm_scenario = None
+        else:
+            if weights is None:
+                raise ValueError("Either weights or weight_schedules must be provided.")
+            single_schedule = _prepare_schedule(weights)
+            self._dm_weight_schedules = None
+            self._weight_schedule = single_schedule
+            self._dm_scenario_selected = "random" if self._randomize_dm_weights else None
+            self._active_dm_scenario = "random" if self._randomize_dm_weights else None
+
         self._current_weight_index = 0
         self.weights = self._weight_schedule[0].copy()
 
@@ -152,8 +846,52 @@ class TrialEnv(gym.Env):
         self.max_duration = float(max_duration)
         self.reward_scale = float(reward_scale)
         self.cost_weight = float(cost_weight)
-        # This environment currently models 8 components explicitly below
-        assert num_nodes == 8, "num_nodes must be 8 to match the hardcoded component mapping (PV, 2 substations, 3 compressors, thermal, LNG)."
+        self.industrial_weight = float(np.clip(industrial_weight, 0.0, 1.0))
+
+        # Load enlarged network configuration from asset and population data
+        project_root = Path(__file__).resolve().parents[1]
+        network_config = _build_default_network(project_root / "data")
+        self.component_specs = list(network_config.components)
+        expected_nodes = len(self.component_specs)
+        if int(num_nodes) != expected_nodes:
+            raise ValueError(
+                f"num_nodes must be {expected_nodes} for the enlarged case study; received {num_nodes}."
+            )
+        self.N = expected_nodes
+
+        self.component_names = [cfg.name for cfg in self.component_specs]
+        self.name_to_index = {name: idx for idx, name in enumerate(self.component_names)}
+        self.component_categories = {cfg.name: cfg.category for cfg in self.component_specs}
+        self.component_dependencies = {cfg.name: tuple(cfg.dependencies) for cfg in self.component_specs}
+        self.substation_generators = {
+            cfg.name: tuple(cfg.generator_sources)
+            for cfg in self.component_specs
+            if cfg.category == "substation"
+        }
+
+        # Compute dependency closures for repair-time aggregation
+        dependency_closure: Dict[str, Tuple[str, ...]] = {}
+
+        def _closure(name: str) -> Tuple[str, ...]:
+            if name in dependency_closure:
+                return dependency_closure[name]
+            closure = {name}
+            for dep in self.component_dependencies.get(name, ()):  # tuples of component names
+                closure.update(_closure(dep))
+            ordered = tuple(sorted(closure))
+            dependency_closure[name] = ordered
+            return ordered
+
+        for component_name in self.component_names:
+            _closure(component_name)
+        self.component_dependency_closure = dependency_closure
+        self.component_upgradable = np.array([cfg.upgradable for cfg in self.component_specs], dtype=bool)
+        self.component_can_fail = np.array([cfg.can_fail for cfg in self.component_specs], dtype=bool)
+        self.component_coordinates = {
+            cfg.name: tuple(cfg.coordinate)
+            for cfg in self.component_specs
+            if cfg.coordinate is not None
+        }
 
         # Store configuration
         self.mc_samples = int(mc_samples)
@@ -170,47 +908,85 @@ class TrialEnv(gym.Env):
         # Normalization toggle
         self.normalize_observations = bool(normalize_observations)
 
+        default_area = np.array([cfg.area for cfg in self.component_specs], dtype=np.float32)
         if area is None:
-            area_array = np.array([100,150,150,50,50,50,200,300], dtype=np.float32)
+            area_array = default_area
         else:
             area_array = np.asarray(area, dtype=np.float32)
             assert area_array.shape == (self.N,), "area must have length N"
         self.area = area_array
 
-        # Placeholder supply/people values per compressor and substation (user can adjust later)
-        self.compressor_order = ["Compressor1", "Compressor2", "Compressor3"]
-        compressor_defaults = {
-            "Compressor1": {"gas_supply": 50.0, "people": 0.0},
-            "Compressor2": {"gas_supply": 35.0, "people": 10000.0},
-            "Compressor3": {"gas_supply": 25.0, "people": 0.0},
-        }
-        self.substation_order = ["Substation1", "Substation2"]
-        substation_defaults = {
-            "Substation1": {"power_supply": 70.0, "people": 0.0},
-            "Substation2": {"power_supply": 30.0, "people": 15000.0},
-        }
+        # Compressor and substation supply/population distributions derived from catalog data
+        self.compressor_order = sorted(network_config.compressor_supply.keys())
+        self.substation_order = sorted(network_config.substation_supply.keys())
 
-        self.compressor_gas_supply = np.array(
-            [compressor_defaults[name]["gas_supply"] for name in self.compressor_order],
-            dtype=np.float32,
+        def _array_from_mapping(order: Sequence[str], mapping: Dict[str, float], label: str) -> np.ndarray:
+            values = []
+            for key in order:
+                if key not in mapping:
+                    raise KeyError(f"'{key}' missing from {label} mapping when building network configuration")
+                values.append(float(mapping[key]))
+            return np.array(values, dtype=np.float32)
+
+        self.compressor_gas_supply = _array_from_mapping(
+            self.compressor_order,
+            network_config.compressor_supply,
+            "compressor supply",
         )
-        self.compressor_people = np.array(
-            [compressor_defaults[name]["people"] for name in self.compressor_order],
-            dtype=np.float32,
+        self.compressor_people = _array_from_mapping(
+            self.compressor_order,
+            network_config.compressor_people,
+            "compressor population",
         )
-        self.substation_power_supply = np.array(
-            [substation_defaults[name]["power_supply"] for name in self.substation_order],
-            dtype=np.float32,
+        self.substation_power_supply = _array_from_mapping(
+            self.substation_order,
+            network_config.substation_supply,
+            "substation supply",
         )
-        self.substation_people = np.array(
-            [substation_defaults[name]["people"] for name in self.substation_order],
-            dtype=np.float32,
+        self.substation_people = _array_from_mapping(
+            self.substation_order,
+            network_config.substation_people,
+            "substation population",
         )
+
+        self.compressor_industrial = _array_from_mapping(
+            self.compressor_order,
+            network_config.compressor_industrial,
+            "compressor industrial",
+        )
+        self.substation_industrial = _array_from_mapping(
+            self.substation_order,
+            network_config.substation_industrial,
+            "substation industrial",
+        )
+        self.compressor_residential = _array_from_mapping(
+            self.compressor_order,
+            network_config.compressor_residential,
+            "compressor residential",
+        )
+        self.substation_residential = _array_from_mapping(
+            self.substation_order,
+            network_config.substation_residential,
+            "substation residential",
+        )
+
+        self.compressor_names = list(self.compressor_order)
+        self.substation_names = list(self.substation_order)
+        self.lng_names = [cfg.name for cfg in self.component_specs if cfg.category == "lng"]
+        self.generation_names = [
+            cfg.name for cfg in self.component_specs if cfg.category in {"renewable", "thermal"}
+        ]
+        self.compressor_indices = [self.name_to_index[name] for name in self.compressor_order]
+        self.substation_indices = [self.name_to_index[name] for name in self.substation_order]
 
         self.total_gas_supply = float(self.compressor_gas_supply.sum())
         self.total_gas_people = float(self.compressor_people.sum())
         self.total_power_supply = float(self.substation_power_supply.sum())
         self.total_power_people = float(self.substation_people.sum())
+        self.total_gas_industrial = float(self.compressor_industrial.sum())
+        self.total_power_industrial = float(self.substation_industrial.sum())
+        self.total_gas_residential = float(self.compressor_residential.sum())
+        self.total_power_residential = float(self.substation_residential.sum())
 
         if self.total_gas_supply > 0.0:
             self.compressor_supply_fraction = (self.compressor_gas_supply / self.total_gas_supply).astype(np.float32)
@@ -232,6 +1008,26 @@ class TrialEnv(gym.Env):
         else:
             self.substation_people_fraction = np.zeros_like(self.substation_people, dtype=np.float32)
 
+        if self.total_gas_industrial > 0.0:
+            self.compressor_industrial_fraction = (self.compressor_industrial / self.total_gas_industrial).astype(np.float32)
+        else:
+            self.compressor_industrial_fraction = np.zeros_like(self.compressor_industrial, dtype=np.float32)
+
+        if self.total_power_industrial > 0.0:
+            self.substation_industrial_fraction = (self.substation_industrial / self.total_power_industrial).astype(np.float32)
+        else:
+            self.substation_industrial_fraction = np.zeros_like(self.substation_industrial, dtype=np.float32)
+
+        if self.total_gas_residential > 0.0:
+            self.compressor_residential_fraction = (self.compressor_residential / self.total_gas_residential).astype(np.float32)
+        else:
+            self.compressor_residential_fraction = np.zeros_like(self.compressor_residential, dtype=np.float32)
+
+        if self.total_power_residential > 0.0:
+            self.substation_residential_fraction = (self.substation_residential / self.total_power_residential).astype(np.float32)
+        else:
+            self.substation_residential_fraction = np.zeros_like(self.substation_residential, dtype=np.float32)
+
         if initial_wall_height is None:
             self.initial_wall_height = np.zeros(self.N, dtype=np.float32)
         else:
@@ -245,20 +1041,24 @@ class TrialEnv(gym.Env):
         action_sizes = np.full(self.N, len(self.height_levels), dtype=np.int64)
         self.action_space = spaces.MultiDiscrete(action_sizes)
 
-        # Observation: [wall_height (N), current_year (1), sea_level_offset (1), econ_impact (1), social_impact (1)]
+        # Observation: [wall_height (N), current_year (1), sea_level_offset (1), dm_weights (6)]
         # Reference scale for normalisation: maximum selectable increment
         self.h_ref = np.full(self.N, self.height_levels[-1], dtype=np.float32)
+        weight_dim = int(self.weights.shape[0])
+        tail_dim = 2 + weight_dim  # year + sea level + decision-maker weights
         if self.normalize_observations:
             # All features scaled to [0,1]
-            low_obs = np.zeros(self.N + 4, dtype=np.float32)
-            high_obs = np.ones(self.N + 4, dtype=np.float32)
+            low_obs = np.zeros(self.N + tail_dim, dtype=np.float32)
+            high_obs = np.ones(self.N + tail_dim, dtype=np.float32)
         else:
             # Raw ranges (year in [0, T]; impacts nonnegative; wall heights unbounded above)
             high_obs = np.array(
-                [1] * self.N + [float(self.T)] + [np.finfo(np.float32).max] * 3,
+                [1] * self.N
+                + [float(self.T)]
+                + [np.finfo(np.float32).max] * (tail_dim - 1),
                 dtype=np.float32,
             )
-            low_obs = np.zeros(self.N + 4, dtype=np.float32)
+            low_obs = np.zeros(self.N + tail_dim, dtype=np.float32)
         self.observation_space = spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
 
         # RNG seed / state
@@ -276,6 +1076,7 @@ class TrialEnv(gym.Env):
         self.gas_soc_mean = 0.0
         self.elec_soc_mean = 0.0
         self._last_positive_mask = np.zeros(self.N, dtype=bool)
+        self._latest_breakdown: Dict[str, float] = {}
 
         # --- Cache CSV and per-row values for fast nearest-neighbour lookup ---
         df_raw = pd.read_csv(self.csv_path, sep=None, engine='python', header=0, index_col=0)
@@ -283,17 +1084,9 @@ class TrialEnv(gym.Env):
         df = df_raw.apply(pd.to_numeric, errors='coerce')
         self.input_grid = np.array(sorted(df.columns), dtype=float)
 
-        self.ROW_FOR_COMPONENT = {
-            'PV': 'P1',
-            'Substation1': 'P2',
-            'Substation2': 'P3',
-            'Compressor1': 'P4',
-            'Compressor2': 'P5',
-            'Compressor3': 'P6',
-            'ThermalUnit': 'P7',
-            'LNG': 'P8',
-        }
-        missing_rows = [r for r in self.ROW_FOR_COMPONENT.values() if r not in df.index]
+        self.ROW_FOR_COMPONENT = {cfg.name: cfg.hazard_key for cfg in self.component_specs}
+        required_rows = {cfg.hazard_key for cfg in self.component_specs}
+        missing_rows = [r for r in required_rows if r not in df.index]
         if missing_rows:
             raise KeyError(f"Missing rows in CSV for points: {missing_rows}. Available rows: {list(df.index)}")
 
@@ -319,7 +1112,63 @@ class TrialEnv(gym.Env):
         elif safe_index > max_idx:
             safe_index = max_idx
         self._current_weight_index = safe_index
-        self.weights = self._weight_schedule[safe_index]
+        if self._randomize_dm_weights:
+            self.weights = self._sample_random_dm_weights()
+        else:
+            self.weights = self._weight_schedule[safe_index]
+
+    def _sample_random_dm_weights(self) -> np.ndarray:
+        """Sample a random decision-maker preference vector with normalized splits."""
+        rng = getattr(self, "rng", None)
+        if rng is None:
+            rng = np.random.default_rng()
+
+        lower_bound = max(WEIGHT_MIN, 1.0 - WEIGHT_MAX)
+        upper_bound = min(WEIGHT_MAX, 1.0 - WEIGHT_MIN)
+        if lower_bound > upper_bound:
+            raise ValueError("Invalid preference bounds; cannot sample bounded splits.")
+
+        def _bounded_pair() -> tuple[float, float]:
+            primary = float(rng.uniform(lower_bound, upper_bound))
+            return primary, 1.0 - primary
+
+        w_gas, w_electricity = _bounded_pair()
+        w_gas_loss, w_gas_social = _bounded_pair()
+        w_elec_loss, w_elec_social = _bounded_pair()
+        return np.array(
+            [
+                np.clip(w_gas, WEIGHT_MIN, WEIGHT_MAX),
+                np.clip(w_electricity, WEIGHT_MIN, WEIGHT_MAX),
+                np.clip(w_gas_loss, WEIGHT_MIN, WEIGHT_MAX),
+                np.clip(w_gas_social, WEIGHT_MIN, WEIGHT_MAX),
+                np.clip(w_elec_loss, WEIGHT_MIN, WEIGHT_MAX),
+                np.clip(w_elec_social, WEIGHT_MIN, WEIGHT_MAX),
+            ],
+            dtype=np.float32,
+        )
+
+    def _select_dm_schedule(self) -> None:
+        """Select the active decision-maker preference schedule for the next episode."""
+        if self._dm_weight_schedules is None:
+            return
+        if self._randomize_dm_weights:
+            scenario_name = "random"
+            reference_key = self._default_dm_schedule_key
+            if reference_key is None:
+                reference_key = next(iter(self._dm_weight_schedules))
+            self._weight_schedule = self._dm_weight_schedules[reference_key]
+            self._active_dm_scenario = scenario_name
+            return
+        preference = self._dm_scenario_selected or "All"
+        if preference == "All":
+            choices = list(self._dm_weight_schedules.keys())
+            if not choices:
+                raise ValueError("weight_schedules mapping is empty.")
+            scenario_name = str(self.rng.choice(choices))
+        else:
+            scenario_name = preference
+        self._weight_schedule = self._dm_weight_schedules[scenario_name]
+        self._active_dm_scenario = scenario_name
 
     # ------------------------
     # Helper computations
@@ -434,12 +1283,10 @@ class TrialEnv(gym.Env):
 
     def _generate_random_streams(self) -> dict[str, np.ndarray]:
         """Pre-draw random numbers reused across metric evaluations."""
-        component_uniform = self.rng.random((8, self.mc_samples)).astype(np.float32, copy=False)
-        feeder_uniform = self.rng.random((3, 2, self.mc_samples)).astype(np.float32, copy=False)
-        repair_normals = self.rng.standard_normal((8, self.mc_samples)).astype(np.float32, copy=False)
+        component_uniform = self.rng.random((self.N, self.mc_samples)).astype(np.float32, copy=False)
+        repair_normals = self.rng.standard_normal((self.N, self.mc_samples)).astype(np.float32, copy=False)
         return {
             "component_uniform": component_uniform,
-            "feeder_uniform": feeder_uniform,
             "repair_normals": repair_normals,
         }
 
@@ -451,6 +1298,7 @@ class TrialEnv(gym.Env):
         *,
         return_cache: bool = False,
         return_details: bool = False,
+        return_states: bool = False,
     ):
         if self._base_heights is None or self._base_durations is None:
             self._generate_hazard_samples()
@@ -461,192 +1309,172 @@ class TrialEnv(gym.Env):
         durations = self._base_durations
 
         grid = self.input_grid
-        idx = np.searchsorted(grid, samples, side='left')
+        idx = np.searchsorted(grid, samples, side="left")
         idx_right = np.clip(idx, 0, grid.size - 1)
         idx_left = np.clip(idx - 1, 0, grid.size - 1)
-        choose_left = (idx <= 0) | (
-            np.abs(samples - grid[idx_left]) <= np.abs(samples - grid[idx_right])
-        )
+        choose_left = (idx <= 0) | (np.abs(samples - grid[idx_left]) <= np.abs(samples - grid[idx_right]))
         nearest_idx = np.where(choose_left, idx_left, idx_right)
 
-        depth_PV = self.depth_vals['PV'][nearest_idx]
-        depth_sub1 = self.depth_vals['Substation1'][nearest_idx]
-        depth_sub2 = self.depth_vals['Substation2'][nearest_idx]
-        depth_comp1 = self.depth_vals['Compressor1'][nearest_idx]
-        depth_comp2 = self.depth_vals['Compressor2'][nearest_idx]
-        depth_comp3 = self.depth_vals['Compressor3'][nearest_idx]
-        depth_therm = self.depth_vals['ThermalUnit'][nearest_idx]
-        depth_LNG = self.depth_vals['LNG'][nearest_idx]
-
-        # Convert depths to fragilities via component-specific curves
-        PV_fragility = np.clip(fragility_PV(depth_PV,    improvement_height[0]), 0.0, 1.0)
-        substation1_fragility = np.clip(fragility_substation(depth_sub1, improvement_height[1]), 0.0, 1.0)
-        substation2_fragility = np.clip(fragility_substation(depth_sub2, improvement_height[2]), 0.0, 1.0)
-        compressor1_fragility = np.clip(fragility_compressor(depth_comp1, improvement_height[3]), 0.0, 1.0)
-        compressor2_fragility = np.clip(fragility_compressor(depth_comp2, improvement_height[4]), 0.0, 1.0)
-        compressor3_fragility = np.clip(fragility_compressor(depth_comp3, improvement_height[5]), 0.0, 1.0)
-        thermal_unit_fragility = np.clip(fragility_thermal_unit(depth_therm, improvement_height[6]), 0.0, 1.0)
-        LNG_terminal_fragility = np.clip(fragility_LNG_terminal(depth_LNG, improvement_height[7]), 0.0, 1.0)
+        depth_samples = {
+            name: self.depth_vals[name][nearest_idx]
+            for name in self.component_names
+        }
 
         cache = random_cache if random_cache is not None else self._generate_random_streams()
         U = cache["component_uniform"]
-        PV_up = (U[0] >= PV_fragility).astype(np.uint8)
-        substation_1 = (U[1] >= substation1_fragility).astype(np.uint8)
-        substation_2 = (U[2] >= substation2_fragility).astype(np.uint8)
-        compressor_1 = (U[3] >= compressor1_fragility).astype(np.uint8)
-        compressor_2 = (U[4] >= compressor2_fragility).astype(np.uint8)
-        compressor_3 = (U[5] >= compressor3_fragility).astype(np.uint8)
-        thermal_unit = (U[6] >= thermal_unit_fragility).astype(np.uint8)
-        LNG_terminal_ = (U[7] >= LNG_terminal_fragility).astype(np.uint8)
+        repair_normals = cache["repair_normals"]
 
-        # Booleans for logic operations
-        PV_b  = PV_up.astype(bool)
-        sub1_b = substation_1.astype(bool)
-        sub2_b = substation_2.astype(bool)
-        comp1_b = compressor_1.astype(bool)
-        comp2_b = compressor_2.astype(bool)
-        comp3_b = compressor_3.astype(bool)
-        therm_b = thermal_unit.astype(bool)
-        LNG_b   = LNG_terminal_.astype(bool)
+        functional: Dict[str, np.ndarray] = {}
+        repair_times: Dict[str, np.ndarray] = {}
 
-        normals = cache["repair_normals"]
-        repair_PV_samples = pv_repair_time(depth_PV, rng=self.rng, normals=normals[0])
-        repair_sub1_samples = substation_repair_time(depth_sub1, rng=self.rng, normals=normals[1])
-        repair_sub2_samples = substation_repair_time(depth_sub2, rng=self.rng, normals=normals[2])
-        repair_comp1_samples = compressor_repair_time(depth_comp1, rng=self.rng, normals=normals[3])
-        repair_comp2_samples = compressor_repair_time(depth_comp2, rng=self.rng, normals=normals[4])
-        repair_comp3_samples = compressor_repair_time(depth_comp3, rng=self.rng, normals=normals[5])
-        repair_therm_samples = thermal_unit_repair_time(depth_therm, rng=self.rng, normals=normals[6])
-        repair_LNG_samples = LNG_repair_time(depth_LNG, rng=self.rng, normals=normals[7])
+        for idx_comp, name in enumerate(self.component_names):
+            category = self.component_categories[name]
+            frag_fn = FRAGILITY_FUNCTIONS[category]
+            repair_fn = REPAIR_FUNCTIONS[category]
+            depths = depth_samples[name]
+            if not self.component_can_fail[idx_comp]:
+                status = np.ones(depths.shape, dtype=bool)
+                functional[name] = status
+                repair_times[name] = np.zeros(depths.shape, dtype=np.float32)
+                continue
+            fragility = np.clip(frag_fn(depths, improvement_height[idx_comp]), 0.0, 1.0)
+            status = U[idx_comp] >= fragility
+            functional[name] = status
+            repair_draws = repair_fn(depths, rng=self.rng, normals=repair_normals[idx_comp])
+            repair_times[name] = np.where(status, 0.0, repair_draws).astype(np.float32)
 
-        repair_PV = np.where(~PV_b, repair_PV_samples, 0.0).astype(np.float32)
-        repair_sub1 = np.where(~sub1_b, repair_sub1_samples, 0.0).astype(np.float32)
-        repair_sub2 = np.where(~sub2_b, repair_sub2_samples, 0.0).astype(np.float32)
-        repair_comp1 = np.where(~comp1_b, repair_comp1_samples, 0.0).astype(np.float32)
-        repair_comp2 = np.where(~comp2_b, repair_comp2_samples, 0.0).astype(np.float32)
-        repair_comp3 = np.where(~comp3_b, repair_comp3_samples, 0.0).astype(np.float32)
-        repair_therm = np.where(~therm_b, repair_therm_samples, 0.0).astype(np.float32)
-        repair_LNG = np.where(~LNG_b, repair_LNG_samples, 0.0).astype(np.float32)
+        availability: Dict[str, np.ndarray] = {}
+
+        def resolve_availability(component: str) -> np.ndarray:
+            if component in availability:
+                return availability[component]
+            base = functional[component].copy()
+            for dep in self.component_dependencies.get(component, ()):  # dependencies follow logical AND
+                base = np.logical_and(base, resolve_availability(dep))
+            availability[component] = base
+            return base
+
+        for name in self.component_names:
+            if self.component_categories[name] != "substation":
+                resolve_availability(name)
+
+        for name in self.substation_names:
+            base = functional[name].copy()
+            for dep in self.component_dependencies.get(name, ()):  # kept for completeness
+                base = np.logical_and(base, resolve_availability(dep))
+            generators = self.substation_generators.get(name, ())
+            if generators:
+                supply = np.zeros_like(base, dtype=bool)
+                for gen in generators:
+                    supply = np.logical_or(supply, resolve_availability(gen))
+            else:
+                supply = np.ones_like(base, dtype=bool)
+            availability[name] = np.logical_and(base, supply)
+
         flood_duration = durations.astype(np.float32)
+        component_downtime: Dict[str, np.ndarray] = {}
 
-        # Source services
-        PV_service  = PV_b.copy()
-        LNG_service = LNG_b.copy()
-        sub2_service = sub2_b & PV_service
+        for name in self.component_names:
+            if self.component_categories[name] == "substation":
+                continue
+            repair_sum = np.zeros_like(flood_duration, dtype=np.float32)
+            for dep in self.component_dependency_closure[name]:
+                repair_sum += repair_times[dep]
+            component_downtime[name] = np.where(
+                ~availability[name],
+                flood_duration + repair_sum,
+                0.0,
+            ).astype(np.float32)
 
-        # Independent feeder availability (decoupled services)
-        p_feeder_avail_c1 = 0.8
-        p_feeder_avail_c2 = 0.8
-        p_feeder_avail_c3 = 0.8
-        feeder_uniform = cache["feeder_uniform"]
-        feed_s1_c1 = feeder_uniform[0, 0] < p_feeder_avail_c1
-        feed_s2_c1 = feeder_uniform[0, 1] < p_feeder_avail_c1
-        feed_s1_c2 = feeder_uniform[1, 0] < p_feeder_avail_c2
-        feed_s2_c2 = feeder_uniform[1, 1] < p_feeder_avail_c2
-        feed_s1_c3 = feeder_uniform[2, 0] < p_feeder_avail_c3
-        feed_s2_c3 = feeder_uniform[2, 1] < p_feeder_avail_c3
-
-        sub1_service = sub1_b & False
-        for _ in range(10):
-            power_ok1 = (sub1_service & feed_s1_c1) | (sub2_service & feed_s2_c1)
-            power_ok2 = (sub1_service & feed_s1_c2) | (sub2_service & feed_s2_c2)
-            power_ok3 = (sub1_service & feed_s1_c3) | (sub2_service & feed_s2_c3)
-
-            comp1_service = comp1_b & power_ok1 & LNG_service
-            comp2_service = comp2_b & power_ok2 & LNG_service
-            comp3_service = comp3_b & power_ok3 & LNG_service
-
-            thermal_unit_service = therm_b & LNG_service & comp3_service
-            sub1_new = sub1_b & thermal_unit_service
-            if np.array_equal(sub1_new, sub1_service):
-                sub1_service = sub1_new
-                break
-            sub1_service = sub1_new
-
-        # Consumer services
-        industrial_gas_service = LNG_service & comp1_service
-        residential_gas_service = LNG_service & comp2_service
-        industrial_elec_service = LNG_service & comp3_service & thermal_unit_service & sub1_service
-        residential_elec_service = PV_service & sub2_service
+        for name in self.substation_names:
+            base_failure = np.where(~functional[name], flood_duration + repair_times[name], 0.0).astype(np.float32)
+            dependency_issue = np.zeros_like(base_failure)
+            for dep in self.component_dependencies.get(name, ()):  # typically empty
+                dependency_issue = np.maximum(
+                    dependency_issue,
+                    component_downtime.get(dep, np.zeros_like(base_failure)),
+                )
+            generator_issue = np.zeros_like(base_failure)
+            for gen in self.substation_generators.get(name, ()):  # generators feeding this node
+                generator_issue = np.maximum(
+                    generator_issue,
+                    component_downtime.get(gen, np.zeros_like(base_failure)),
+                )
+            total_issue = np.maximum(base_failure, dependency_issue)
+            total_issue = np.maximum(total_issue, generator_issue)
+            component_downtime[name] = np.where(~availability[name], total_issue, 0.0).astype(np.float32)
 
         max_event_time = np.float32(self.max_duration + self.maximum_repair_time)
         max_event_time = np.clip(max_event_time, a_min=np.float32(1e-6), a_max=None)
 
-        gas_services = np.stack([comp1_service, comp2_service, comp3_service])
-        gas_service_times = np.stack([
-            np.where(
-                ~industrial_gas_service,
-                flood_duration + repair_LNG + repair_comp1 + repair_sub1 + repair_sub2 + repair_therm + repair_comp3,
-                0.0,
-            ),
-            np.where(
-                ~residential_gas_service,
-                flood_duration + repair_LNG + repair_comp2 + repair_sub1 + repair_sub2 + repair_therm + repair_comp3,
-                0.0,
-            ),
-            np.where(
-                ~comp3_service,
-                flood_duration + repair_LNG + repair_comp3 + repair_sub1 + repair_sub2 + repair_therm,
-                0.0,
-            ),
-        ]).astype(np.float32)
-        gas_time_ratio = np.clip(gas_service_times / max_event_time, a_min=0.0, a_max=1.0)
-        gas_outage_fraction = np.logical_not(gas_services).astype(np.float32) * self.compressor_supply_fraction[:, None]
-        gas_loss_samples = (gas_outage_fraction * gas_time_ratio).sum(axis=0)
-        gas_social_fraction = np.logical_not(gas_services).astype(np.float32) * self.compressor_people_fraction[:, None]
+        gas_services = np.stack([availability[name] for name in self.compressor_order])
+        gas_downtime = np.stack([component_downtime[name] for name in self.compressor_order])
+        gas_time_ratio = np.clip(gas_downtime / max_event_time, a_min=0.0, a_max=1.0)
+        gas_unavailable = 1.0 - gas_services.astype(np.float32)
+        gas_supply_fraction = gas_unavailable * self.compressor_supply_fraction[:, None]
+        gas_supply_loss_samples = (gas_supply_fraction * gas_time_ratio).sum(axis=0)
+        gas_industrial_fraction = gas_unavailable * self.compressor_industrial_fraction[:, None]
+        gas_industrial_loss_samples = (gas_industrial_fraction * gas_time_ratio).sum(axis=0)
+        gas_loss_samples = (
+            (1.0 - self.industrial_weight) * gas_supply_loss_samples
+            + self.industrial_weight * gas_industrial_loss_samples
+        )
+        gas_social_fraction = gas_unavailable * self.compressor_residential_fraction[:, None]
         gas_social_samples = (gas_social_fraction * gas_time_ratio).sum(axis=0)
 
-        power_services = np.stack([industrial_elec_service, residential_elec_service])
-        power_service_times = np.stack([
-            np.where(
-                ~industrial_elec_service,
-                flood_duration + repair_LNG + repair_comp3 + repair_therm + repair_sub1,
-                0.0,
-            ),
-            np.where(
-                ~residential_elec_service,
-                flood_duration + repair_PV + repair_sub2,
-                0.0,
-            ),
-        ]).astype(np.float32)
-        power_time_ratio = np.clip(power_service_times / max_event_time, a_min=0.0, a_max=1.0)
-        power_outage_fraction = np.logical_not(power_services).astype(np.float32) * self.substation_supply_fraction[:, None]
-        electricity_loss_samples = (power_outage_fraction * power_time_ratio).sum(axis=0)
-        power_social_fraction = np.logical_not(power_services).astype(np.float32) * self.substation_people_fraction[:, None]
+        power_services = np.stack([availability[name] for name in self.substation_order])
+        power_downtime = np.stack([component_downtime[name] for name in self.substation_order])
+        power_time_ratio = np.clip(power_downtime / max_event_time, a_min=0.0, a_max=1.0)
+        power_unavailable = 1.0 - power_services.astype(np.float32)
+        power_supply_fraction = power_unavailable * self.substation_supply_fraction[:, None]
+        power_supply_loss_samples = (power_supply_fraction * power_time_ratio).sum(axis=0)
+        power_industrial_fraction = power_unavailable * self.substation_industrial_fraction[:, None]
+        power_industrial_loss_samples = (power_industrial_fraction * power_time_ratio).sum(axis=0)
+        electricity_loss_samples = (
+            (1.0 - self.industrial_weight) * power_supply_loss_samples
+            + self.industrial_weight * power_industrial_loss_samples
+        )
+        power_social_fraction = power_unavailable * self.substation_residential_fraction[:, None]
         electricity_social_samples = (power_social_fraction * power_time_ratio).sum(axis=0)
+
+        gas_supply_mean = float(gas_supply_loss_samples.mean())
+        gas_industrial_mean = float(gas_industrial_loss_samples.mean())
         gas_loss_mean = float(gas_loss_samples.mean())
+        elec_supply_mean = float(power_supply_loss_samples.mean())
+        elec_industrial_mean = float(power_industrial_loss_samples.mean())
         elec_loss_mean = float(electricity_loss_samples.mean())
         gas_social_mean = float(gas_social_samples.mean())
         elec_social_mean = float(electricity_social_samples.mean())
+
+        self._latest_breakdown = {
+            "gas_supply_mean": gas_supply_mean,
+            "gas_industrial_mean": gas_industrial_mean,
+            "gas_total_mean": gas_loss_mean,
+            "elec_supply_mean": elec_supply_mean,
+            "elec_industrial_mean": elec_industrial_mean,
+            "elec_total_mean": elec_loss_mean,
+            "gas_social_mean": gas_social_mean,
+            "elec_social_mean": elec_social_mean,
+        }
+
+        state_payload = None
+        if return_states:
+            state_payload = {
+                "functional": {name: functional[name].copy() for name in self.component_names},
+                "availability": {name: availability[name].copy() for name in self.component_names},
+            }
+
         depth_means = {
-            "PV": float(depth_PV.mean() + offset),
-            "Substation1": float(depth_sub1.mean() + offset),
-            "Substation2": float(depth_sub2.mean() + offset),
-            "Compressor1": float(depth_comp1.mean() + offset),
-            "Compressor2": float(depth_comp2.mean() + offset),
-            "Compressor3": float(depth_comp3.mean() + offset),
-            "ThermalUnit": float(depth_therm.mean() + offset),
-            "LNG": float(depth_LNG.mean() + offset),
+            name: float(depth_samples[name].mean() + offset)
+            for name in self.component_names
         }
         depth_p95 = {
-            "PV": float(np.percentile(depth_PV, 95) + offset),
-            "Substation1": float(np.percentile(depth_sub1, 95) + offset),
-            "Substation2": float(np.percentile(depth_sub2, 95) + offset),
-            "Compressor1": float(np.percentile(depth_comp1, 95) + offset),
-            "Compressor2": float(np.percentile(depth_comp2, 95) + offset),
-            "Compressor3": float(np.percentile(depth_comp3, 95) + offset),
-            "ThermalUnit": float(np.percentile(depth_therm, 95) + offset),
-            "LNG": float(np.percentile(depth_LNG, 95) + offset),
+            name: float(np.percentile(depth_samples[name], 95) + offset)
+            for name in self.component_names
         }
         depth_max = {
-            "PV": float(depth_PV.max() + offset),
-            "Substation1": float(depth_sub1.max() + offset),
-            "Substation2": float(depth_sub2.max() + offset),
-            "Compressor1": float(depth_comp1.max() + offset),
-            "Compressor2": float(depth_comp2.max() + offset),
-            "Compressor3": float(depth_comp3.max() + offset),
-            "ThermalUnit": float(depth_therm.max() + offset),
-            "LNG": float(depth_LNG.max() + offset),
+            name: float(depth_samples[name].max() + offset)
+            for name in self.component_names
         }
 
         metrics = (
@@ -655,13 +1483,16 @@ class TrialEnv(gym.Env):
             gas_social_mean,
             elec_social_mean,
         )
-        if return_cache and return_details:
-            return metrics, cache, (depth_means, depth_p95, depth_max)
+        extras: list = []
         if return_cache:
-            return metrics, cache
+            extras.append(cache)
         if return_details:
-            return metrics, (depth_means, depth_p95, depth_max)
-        return metrics
+            extras.append((depth_means, depth_p95, depth_max))
+        if return_states:
+            extras.append(state_payload)
+        if not extras:
+            return metrics
+        return (metrics, *extras)
 
     def _compute_loss(self, metrics: tuple[float, float, float, float]) -> float:
         gas_loss, elec_loss, gas_social, elec_social = metrics
@@ -682,6 +1513,22 @@ class TrialEnv(gym.Env):
 
     def _obs(self) -> np.ndarray:
         sea_level_offset = float(self._sea_level_offset_for_year(self._year))
+        sea_var = abs(0.02 * sea_level_offset)
+        if sea_var > 0.0:
+            sea_noise = float(self.rng.normal(loc=0.0, scale=sea_var))
+        else:
+            sea_noise = 0.0
+        noisy_sea_offset = max(sea_level_offset + sea_noise, 0.0)
+
+        base_weights = self.weights.astype(np.float32)
+        weight_std = 0.1 * np.abs(base_weights)
+        if base_weights.size:
+            weight_noise = self.rng.normal(loc=0.0, scale=weight_std).astype(np.float32)
+            noisy_weights = base_weights + weight_noise
+        else:
+            noisy_weights = base_weights.copy()
+        noisy_weights = np.clip(noisy_weights, 0.0, None)
+
         if self.normalize_observations:
             # Normalize wall heights by (h_ref * T), clip to [0,1]
             denom = (self.h_ref * self.T).astype(np.float32)
@@ -689,18 +1536,22 @@ class TrialEnv(gym.Env):
             wh = np.clip(self.wall_height / denom, 0.0, 1.0).astype(np.float32)
             yr = np.float32(self._year / self.T)
             if self.max_depth > 0.0:
-                sea = np.float32(np.clip(sea_level_offset / self.max_depth, 0.0, 1.0))
+                sea = np.float32(np.clip(noisy_sea_offset / self.max_depth, 0.0, 1.0))
             else:
                 sea = np.float32(0.0)
-            econ = np.float32(min(self._econ_impact / 2.0, 1.0))
-            soc = np.float32(min(self._social_impact / 2.0, 1.0))
-            tail = np.array([yr, sea, econ, soc], dtype=np.float32)
-            return np.concatenate([wh, tail])
+            weight_tail = np.clip(noisy_weights, 0.0, 1.0).astype(np.float32)
+            tail = np.concatenate(
+                (np.array([yr, sea], dtype=np.float32), weight_tail),
+            )
+            return np.concatenate([wh, tail]).astype(np.float32)
         else:
-            return np.concatenate([
-                self.wall_height.astype(np.float32),
-                np.array([self._year, sea_level_offset, self._econ_impact, self._social_impact], dtype=np.float32),
-            ])
+            tail = np.concatenate(
+                (
+                    np.array([float(self._year), noisy_sea_offset], dtype=np.float32),
+                    noisy_weights.astype(np.float32),
+                ),
+            )
+            return np.concatenate([self.wall_height.astype(np.float32), tail]).astype(np.float32)
 
     # ------------------------
     # Gym API
@@ -710,6 +1561,7 @@ class TrialEnv(gym.Env):
         if seed is not None:
             self.np_random, _ = gym.utils.seeding.np_random(seed)
             self.rng = self.np_random
+        self._select_dm_schedule()
         # Start from new
         self.wall_height = self.initial_wall_height.copy()
         self.improvement_height = np.zeros(self.N, dtype=np.float32)
@@ -731,6 +1583,8 @@ class TrialEnv(gym.Env):
         self._prev_metrics = metrics
         self._prev_loss = self._compute_loss(metrics)
         info = {}
+        if self._active_dm_scenario is not None:
+            info["dm_scenario"] = self._active_dm_scenario
         if self._active_climate_scenario is not None and self._sea_level_offsets is not None:
             info["climate_scenario"] = self._active_climate_scenario
             info["sea_level_offset"] = float(self._sea_level_offsets[0])
@@ -745,11 +1599,15 @@ class TrialEnv(gym.Env):
         np.clip(action_array, 0, len(self.height_levels) - 1, out=action_array)
 
         intended_heights = self.height_levels[action_array]
+        non_upgradable_mask = ~self.component_upgradable
+        if np.any(non_upgradable_mask):
+            intended_heights = intended_heights.astype(np.float32)
+            intended_heights[non_upgradable_mask] = 0.0
         executed_heights = intended_heights.astype(np.float32).copy()
         prev_improvement = self.improvement_height.astype(np.float32).copy()
 
         # Penalise repeated upgrades on consecutive steps
-        repeat_mask = self._last_positive_mask & (executed_heights > 0.0)
+        repeat_mask = self._last_positive_mask & (executed_heights > 0.0) & self.component_upgradable
         repeat_count = int(repeat_mask.sum())
         repeat_penalty_total = 0.0
         if repeat_count:
@@ -779,7 +1637,7 @@ class TrialEnv(gym.Env):
                 over_budget_penalty_total = self.cost_weight * (over_budget_amount / self.budget if self.budget > 0.0 else over_budget_amount)
 
         post_improvement = np.maximum(prev_improvement + executed_heights, 0.0)
-        self._last_positive_mask = executed_heights > 0.0
+        self._last_positive_mask = (executed_heights > 0.0) & self.component_upgradable
         self._year += self.year_step
         current_year = self._year
         sea_level_step_index = current_year // self.year_step if self.year_step > 0 else 0
@@ -877,7 +1735,17 @@ class TrialEnv(gym.Env):
             "climate_drift": float(climate_drift),
             "action_gain": float(action_gain),
         }
+        breakdown = getattr(self, "_latest_breakdown", None)
+        if breakdown:
+            info["gas_supply_loss_mean"] = float(breakdown.get("gas_supply_mean", 0.0))
+            info["gas_industrial_loss_mean"] = float(breakdown.get("gas_industrial_mean", 0.0))
+            info["elec_supply_loss_mean"] = float(breakdown.get("elec_supply_mean", 0.0))
+            info["elec_industrial_loss_mean"] = float(breakdown.get("elec_industrial_mean", 0.0))
+            info["gas_social_loss_mean"] = float(breakdown.get("gas_social_mean", 0.0))
+            info["elec_social_loss_mean"] = float(breakdown.get("elec_social_mean", 0.0))
         info["repeat_penalty"] = float(repeat_penalty_total)
+        if self._active_dm_scenario is not None:
+            info["dm_scenario"] = self._active_dm_scenario
         if self._active_climate_scenario is not None:
             info["climate_scenario"] = self._active_climate_scenario
             info["sea_level_offset"] = float(self._sea_level_offset_for_year(current_year))

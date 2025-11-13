@@ -6,6 +6,7 @@ import math
 import json
 import csv
 import shutil
+from pathlib import Path
 from typing import Sequence
 import numpy as np
 import torch
@@ -13,20 +14,24 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import gymnasium as gym
 
-# -------------------- User parameters --------------------
-SCENARIO_NAME = "neutral"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social)
-CLIMATE_SCENARIO = "SSP5-8.5"  # sea level rise projections (SSP1-1.9, SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5, All)
-BUDGET = 500000
-MC_SAMPLES = 50000
+from utils.environment import TrialEnv, _build_default_network  # must be importable at top level
 
-num_nodes = 8
+# -------------------- User parameters --------------------
+SCENARIO_NAME = "random"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social, All, random)
+CLIMATE_SCENARIO = "All"  # sea level rise projections (SSP1-1.9, SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5, All)
+BUDGET = 500000
+MC_SAMPLES = 1000
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+_NETWORK_CONFIG = _build_default_network(PROJECT_ROOT / "data")
+num_nodes = len(_NETWORK_CONFIG.components)
 years = 75 # until 2100
 year_step = 5 # 15 decisions
-RL_steps = 5000000
+RL_steps = 30000000
 learning_rate = 5e-4
 
 # Per-asset footprint areas (m^2)
-area = np.array([100, 150, 150, 50, 50, 50, 200, 300], dtype=np.float32)
+area = np.array([cfg.area for cfg in _NETWORK_CONFIG.components], dtype=np.float32)
 
 
 #CAN TRY GAE_LAMBDA = 0.9 OR LARGER CRITIC NETWORK OR DIFFERENT LEARNING RATE IF EXPLAINED VARIANCE IS STILL LOW/NEGATIVE 
@@ -50,15 +55,18 @@ from stable_baselines3.common.callbacks import (
     CallbackList,
     CheckpointCallback,
 )
-from utils.environment import TrialEnv  # must be importable at top level
 
 WEIGHT_VECTOR_KEYS = ("W_g", "W_e", "W_ge", "W_gs", "W_ee", "W_es")
 
 _NORMAL_95_Z = 1.6448536269514722  # z-score for the 95th percentile of the standard normal
 
 
-def load_dm_weight_schedule(csv_path: str, scenario: str, years: int, year_step: int) -> tuple[np.ndarray, list[int]]:
-    """Load time-dependent weights for the requested scenario."""
+def load_dm_weight_schedules(
+    csv_path: str,
+    years: int,
+    year_step: int,
+) -> tuple[dict[str, np.ndarray], list[int]]:
+    """Load time-dependent weights for every decision-maker scenario in the CSV."""
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Scenario file not found: {csv_path}")
 
@@ -71,25 +79,20 @@ def load_dm_weight_schedule(csv_path: str, scenario: str, years: int, year_step:
     df["scenario"] = df["scenario"].astype(str).str.strip()
     df["weight"] = df["weight"].astype(str).str.strip()
 
-    scenario_df = df[df["scenario"] == scenario].copy()
-    if scenario_df.empty:
-        available = sorted(df["scenario"].astype(str).str.strip().unique())
-        raise ValueError(f"Scenario '{scenario}' not found. Available scenarios: {available}")
+    duplicate_rows = df[df.duplicated(subset=["scenario", "weight"], keep=False)]
+    if not duplicate_rows.empty:
+        duplicates = (
+            duplicate_rows[["scenario", "weight"]]
+            .drop_duplicates()
+            .apply(lambda row: f"{row['scenario']}/{row['weight']}", axis=1)
+            .tolist()
+        )
+        raise ValueError(f"Duplicate weight rows detected for {duplicates}.")
 
-    duplicate_weights = scenario_df["weight"][scenario_df["weight"].duplicated()].unique()
-    if len(duplicate_weights):
-        raise ValueError(f"Duplicate weight rows for {duplicate_weights.tolist()} in scenario '{scenario}'.")
-
-    scenario_df = scenario_df.set_index("weight")
-    scenario_df = scenario_df.drop(columns=["scenario", "commodity"], errors="ignore")
-
-    missing_keys = [key for key in WEIGHT_VECTOR_KEYS if key not in scenario_df.index]
-    if missing_keys:
-        raise ValueError(f"Scenario '{scenario}' missing entries for {missing_keys}.")
-
-    value_cols = [col for col in scenario_df.columns if col.strip()]
+    scenario_params: dict[str, np.ndarray] = {}
+    value_cols = [col for col in df.columns if col not in {"scenario", "weight", "commodity"}]
     if not value_cols:
-        raise ValueError(f"No time-step columns found for scenario '{scenario}'.")
+        raise ValueError("Scenario CSV does not contain any time-step columns.")
 
     try:
         sorted_cols = sorted(value_cols, key=lambda c: int(float(c)))
@@ -99,20 +102,39 @@ def load_dm_weight_schedule(csv_path: str, scenario: str, years: int, year_step:
     required_points = math.ceil(years / year_step) + 1
     if len(sorted_cols) < required_points:
         raise ValueError(
-            f"Scenario '{scenario}' provides {len(sorted_cols)} time points; "
+            f"Decision-maker CSV provides {len(sorted_cols)} time points; "
             f"{required_points} required for {years} years with step {year_step}."
         )
 
     selected_cols = sorted_cols[:required_points]
-    weights_df = scenario_df.reindex(WEIGHT_VECTOR_KEYS)[selected_cols].apply(pd.to_numeric, errors="coerce")
-
-    if weights_df.isnull().any().any():
-        missing_cols = weights_df.columns[weights_df.isnull().any()].tolist()
-        raise ValueError(f"Scenario '{scenario}' contains NaNs for years {missing_cols}.")
-
-    schedule = weights_df.to_numpy(dtype=np.float32).T
     decision_years = [int(float(col)) for col in selected_cols]
-    return schedule, decision_years
+
+    for scenario_name, scenario_df in df.groupby("scenario"):
+        pivot = (
+            scenario_df.drop(columns=["scenario", "commodity"], errors="ignore")
+            .set_index("weight")
+            .reindex(WEIGHT_VECTOR_KEYS)
+        )
+        if pivot.isnull().any().any():
+            missing_rows = pivot.index[pivot.isnull().any(axis=1)].tolist()
+            raise ValueError(
+                f"Scenario '{scenario_name}' missing entries for {missing_rows} or contains NaNs."
+            )
+
+        weights_df = pivot[selected_cols].apply(pd.to_numeric, errors="coerce")
+        if weights_df.isnull().any().any():
+            missing_cols = weights_df.columns[weights_df.isnull().any()].tolist()
+            raise ValueError(
+                f"Scenario '{scenario_name}' contains NaNs in the selected years {missing_cols}."
+            )
+
+        schedule = weights_df.to_numpy(dtype=np.float32).T
+        scenario_params[str(scenario_name)] = schedule
+
+    if not scenario_params:
+        raise ValueError("No decision-maker scenarios were parsed from the CSV.")
+
+    return scenario_params, decision_years
 
 
 def load_sea_level_scenarios(
@@ -209,9 +231,8 @@ def load_sea_level_scenarios(
     return scenario_params, decision_years
 
 DM_SCENARIOS_PATH = os.path.join("Decision Makers Preferences", "DM_Scenarios.csv")
-weights_schedule, weight_years = load_dm_weight_schedule(
+dm_weight_schedules, weight_years = load_dm_weight_schedules(
     DM_SCENARIOS_PATH,
-    SCENARIO_NAME,
     years,
     year_step,
 )
@@ -226,7 +247,8 @@ sea_level_scenarios, _ = load_sea_level_scenarios(
 env_kwargs = dict(
     num_nodes=num_nodes,
     years=years,
-    weights=weights_schedule,
+    weight_schedules=dm_weight_schedules,
+    dm_scenario=SCENARIO_NAME,
     budget=BUDGET,
     year_step=year_step,
     area=area,
@@ -239,25 +261,28 @@ env_kwargs = dict(
     climate_scenario=CLIMATE_SCENARIO,
 )
 
-RESULTS_DIR = "results"
-LOG_DIR = "log"
-os.makedirs(RESULTS_DIR, exist_ok=True)
+def _capitalize_first(text: str) -> str:
+    return text[:1].upper() + text[1:] if text else text
+
+LOG_BASE_DIR = "log"
+scenario_log_name = _capitalize_first(SCENARIO_NAME.replace("_", "-").replace(" ", "-"))
+climate_log_name = CLIMATE_SCENARIO.replace("_", "-").replace(" ", "-")
+LOG_RUN_NAME = f"{scenario_log_name}-{climate_log_name}"
+LOG_DIR = os.path.join(LOG_BASE_DIR, LOG_RUN_NAME)
+
+scenario_results_name = SCENARIO_NAME.replace(" ", "_").replace("-", "_")
+climate_results_name = CLIMATE_SCENARIO.replace(" ", "_")
+RESULTS_DIR = f"results_{scenario_results_name}_{climate_results_name}"
+
 os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
 BEST_MODEL_DIR = os.path.join(RESULTS_DIR, "best_models")
 CHECKPOINT_DIR = os.path.join(RESULTS_DIR, "checkpoints")
 os.makedirs(BEST_MODEL_DIR, exist_ok=True)
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-ASSET_NAMES = [
-    "PV",
-    "Substation1",
-    "Substation2",
-    "Compressor1",
-    "Compressor2",
-    "Compressor3",
-    "ThermalUnit",
-    "LNG",
-]
+ASSET_NAMES = [cfg.name for cfg in _NETWORK_CONFIG.components]
 
 
 def linear_schedule(start: float, end: float):
@@ -419,6 +444,18 @@ class InfoMetricsCallback(BaseCallback):
         self.prefix = prefix.rstrip("/")
         self.log_std = bool(log_std)
         self._buffer: dict[str, list[float]] = {key: [] for key in self.keys}
+        self._aliases = {
+            "over_budget_penalty_signed": "over_pen_signed",
+            "over_budget_penalty": "over_pen",
+            "unused_budget_penalty_signed": "unused_pen_signed",
+            "unused_budget_penalty": "unused_pen",
+            "gas_supply_loss_mean": "gas_supply",
+            "gas_industrial_loss_mean": "gas_ind",
+            "elec_supply_loss_mean": "elec_supply",
+            "elec_industrial_loss_mean": "elec_ind",
+            "gas_social_loss_mean": "gas_soc",
+            "elec_social_loss_mean": "elec_soc",
+        }
 
     def _init_buffer(self) -> None:
         self._buffer = {key: [] for key in self.keys}
@@ -440,9 +477,10 @@ class InfoMetricsCallback(BaseCallback):
             if not values:
                 continue
             arr = np.asarray(values, dtype=np.float32)
-            self.logger.record(f"{self.prefix}/{key}_mean", float(arr.mean()))
+            alias = self._aliases.get(key, key)
+            self.logger.record(f"{self.prefix}/{alias}_mean", float(arr.mean()))
             if self.log_std:
-                self.logger.record(f"{self.prefix}/{key}_std", float(arr.std()))
+                self.logger.record(f"{self.prefix}/{alias}_std", float(arr.std()))
         self._init_buffer()
         return True
 
@@ -553,7 +591,7 @@ def main():
         max_grad_norm=0.5,
         policy_kwargs=policy_kwargs,
         verbose=1,
-        tensorboard_log="./log",
+        tensorboard_log=LOG_BASE_DIR,
         device=device,
         seed=seed,
     )
@@ -572,6 +610,12 @@ def main():
         "total_cost",
         "unused_budget",
         "over_budget_amount",
+        "gas_supply_loss_mean",
+        "gas_industrial_loss_mean",
+        "elec_supply_loss_mean",
+        "elec_industrial_loss_mean",
+        "gas_social_loss_mean",
+        "elec_social_loss_mean",
     )
     info_callback = InfoMetricsCallback(keys=info_keys, prefix="train/info", verbose=0)
 
@@ -596,7 +640,7 @@ def main():
     )
     callback = CallbackList([entropy_callback, action_callback, info_callback, eval_callback, checkpoint_callback])
 
-    model.learn(total_timesteps=RL_steps, callback=callback)
+    model.learn(total_timesteps=RL_steps, callback=callback, tb_log_name=LOG_RUN_NAME)
     model.save(os.path.join(RESULTS_DIR, "policy"))
     eval_env_vec.close()
 

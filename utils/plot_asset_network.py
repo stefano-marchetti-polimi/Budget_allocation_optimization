@@ -1,15 +1,19 @@
 """Plot the dependency network of assets in the TrialEnv environment.
 
 The relationships mirror the logical dependencies implemented in
-``utils.environment_placeholder.TrialEnv._compute_metrics`` where service
-availability propagates across assets such as PV, substations, compressors,
-the thermal unit, and the LNG terminal.
+``utils.environment.TrialEnv._compute_metrics`` where service
+availability propagates across components such as generation, compressors,
+substations, and the LNG terminal.
 """
 
 from __future__ import annotations
 
+from itertools import filterfalse
 import math
+import sys
+from functools import lru_cache
 from pathlib import Path
+from tkinter import FALSE
 from typing import Dict, Mapping, Sequence, Tuple
 import warnings
 
@@ -23,97 +27,107 @@ import numpy as np
 import rasterio as rio
 from matplotlib import patheffects
 from matplotlib.lines import Line2D
+from rasterio.errors import RasterioIOError
 from rasterio.plot import plotting_extent
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from utils.environment import ASSET_COORD_CRS, _build_default_network
 
 __all__ = ["plot_asset_dependency_network"]
 
-# Directed dependencies: each asset lists the upstream components it requires
-# to be operational. Edges are drawn from dependency -> dependent.
-BASE_ASSET_DEPENDENCIES: Mapping[str, Sequence[str]] = {
-    "Substation2": ("PV",),
-    "Compressor1": ("LNG", "Substation1", "Substation2"),
-    "Compressor2": ("LNG", "Substation1", "Substation2"),
-    "Compressor3": ("LNG", "Substation1", "Substation2"),
-    "ThermalUnit": ("Compressor3",),
-    "Substation1": ("ThermalUnit",),
+# Presentation metadata for component categories.
+CATEGORY_LABELS: Mapping[str, str] = {
+    "renewable": "Renewable Generation",
+    "thermal": "Thermal Generation",
+    "lng": "Fuel Supply",
+    "compressor": "Gas Compression (per plant)",
+    "substation": "Electrical Distribution",
 }
 
-# Asset categories drive node styling on the plot.
-ASSET_TYPE_MAP: Mapping[str, str] = {
-    "PV": "Renewable Generation",
-    "ThermalUnit": "Thermal Generation",
-    "LNG": "Fuel Supply",
-    "Substation1": "Electrical Distribution",
-    "Substation2": "Electrical Distribution",
-    "Compressor1": "Gas Compression",
-    "Compressor2": "Gas Compression",
-    "Compressor3": "Gas Compression",
+CATEGORY_COLORS: Mapping[str, str] = {
+    "renewable": "#5ab4ac",
+    "thermal": "#b8860b",
+    "lng": "#6c93ff",
+    "compressor": "#80b1d3",
+    "substation": "#c7e9c0",
+    "unclassified": "#bdbdbd",
 }
 
-ASSET_TYPE_COLORS: Mapping[str, str] = {
-    "Renewable Generation": "#5ab4ac",
-    "Thermal Generation": "#b8860b",
-    "Fuel Supply": "#6c93ff",
-    "Electrical Distribution": "#c7e9c0",
-    "Gas Compression": "#80b1d3",
-    "Unclassified": "#bdbdbd",
-}
-
-# Optional edge labels to highlight the role of key connections.
-BASE_EDGE_LABELS: Dict[Tuple[str, str], str] = {}
-
-# Manually chosen coordinates to keep the diagram easy to read.
-BASE_MANUAL_POSITIONS: Mapping[str, Tuple[float, float]] = {
-    # Anchor sources far apart so downstream edges do not stack.
-    "PV": (-10.0, 4.5),
-    "LNG": (12.0, 6.0),
-    # Downstream assets arranged to follow the logical flow left-to-right.
-    "Substation2": (-5.0, 3.2),
-    "Compressor1": (1.0, 7.5),
-    "Compressor2": (1.0, 2.2),
-    "Compressor3": (1.0, -3.0),
-    "ThermalUnit": (3.5, -5.5),
-    "Substation1": (10.0, 0.0),
-}
-
-# Real-world coordinates for assets as used in the hazard sampling workflow.
-BASE_ASSET_COORDINATES: Mapping[str, Tuple[float, float]] = {
-    "PV": (415337.819, 3321791.508),
-    "Substation1": (471235.458, 3349033.547),
-    "Substation2": (313798.678, 3292636.851),
-    "Compressor1": (429265.789, 3347691.776),
-    "Compressor2": (295005.562, 3302607.527),
-    "Compressor3": (307580.921, 3264174.781),
-    "ThermalUnit": (312418.912, 3251429.175),
-    "LNG": (265455.097, 3209409.708),
-}
-
-ASSET_COORD_CRS = "EPSG:32615"
-DEFAULT_DEM_PATH = Path("data/houston_example_DEM_30m.tif")
-DEFAULT_BACKGROUND_IMAGE = Path("data/inun_zero_depth.png")
-REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CATEGORY_LABEL = "Unclassified"
+DEFAULT_DEM_PATH = REPO_ROOT / "data" / "houston_example_DEM_30m.tif"
+DEFAULT_BACKGROUND_IMAGE = REPO_ROOT / "data" / "houston_example_DEM_30m_coastal_inundation.tif"
 DEFAULT_IMAGE_DIR = REPO_ROOT / "Images"
 DEFAULT_PRIMARY_FILENAME = "asset_dependency_map.png"
 
 
+@lru_cache(maxsize=1)
+def _network_snapshot() -> Dict[str, object]:
+    network = _build_default_network(REPO_ROOT / "data")
+    dependencies = {
+        cfg.name: tuple(cfg.dependencies)
+        for cfg in network.components
+        if cfg.dependencies
+    }
+    compressor_set = {cfg.name for cfg in network.components if cfg.category == "compressor"}
+    compressor_assignments: Dict[str, str] = {}
+    edges: set[Tuple[str, str]] = set()
+    for cfg in network.components:
+        for dep in cfg.dependencies:
+            edges.add((dep, cfg.name))
+            if cfg.category == "thermal" and dep in compressor_set:
+                compressor_assignments[dep] = cfg.name
+        for source in cfg.generator_sources:
+            edges.add((source, cfg.name))
+    category_map = {cfg.name: cfg.category for cfg in network.components}
+    coordinates = {
+        cfg.name: tuple(cfg.coordinate)
+        for cfg in network.components
+        if cfg.coordinate is not None
+    }
+    components = {cfg.name: cfg for cfg in network.components}
+    return {
+        "dependencies": dependencies,
+        "edges": tuple(sorted(edges)),
+        "category_map": category_map,
+        "coordinates": coordinates,
+        "components": components,
+        "compressor_people": network.compressor_people,
+        "compressor_industrial": network.compressor_industrial,
+        "compressor_residential": network.compressor_residential,
+        "compressor_supply": network.compressor_supply,
+        "substation_people": network.substation_people,
+        "substation_industrial": network.substation_industrial,
+        "substation_residential": network.substation_residential,
+        "substation_supply": network.substation_supply,
+        "county_coordinates": network.county_coordinates,
+        "county_population": network.county_population,
+        "asset_counties": network.asset_counties,
+        "county_display_names": network.county_display_names,
+        "compressor_assignments": compressor_assignments,
+    }
+
+
 def _dependency_map() -> Dict[str, Sequence[str]]:
-    return dict(BASE_ASSET_DEPENDENCIES)
+    snapshot = _network_snapshot()
+    return {asset: deps[:] for asset, deps in snapshot["dependencies"].items()}
 
 
 def _edge_labels() -> Dict[Tuple[str, str], str]:
-    return dict(BASE_EDGE_LABELS)
-
-
-def _manual_positions() -> Dict[str, Tuple[float, float]]:
-    return dict(BASE_MANUAL_POSITIONS)
+    return {}
 
 
 def _collect_assets(dependency_map: Mapping[str, Sequence[str]]) -> Sequence[str]:
-    """Gather the unique set of assets present in the dependency map."""
-    downstream = set(dependency_map.keys())
-    upstream = {asset for deps in dependency_map.values() for asset in deps}
-    ordered = list(dict.fromkeys(list(upstream) + list(downstream)))
-    return sorted(ordered)
+    snapshot = _network_snapshot()
+    nodes = sorted(snapshot["components"].keys())
+    return nodes
+
+
+def _edge_list() -> Sequence[Tuple[str, str]]:
+    snapshot = _network_snapshot()
+    return list(snapshot["edges"])
 
 
 def _circular_layout(nodes: Sequence[str], radius: float = 2.5) -> Dict[str, Tuple[float, float]]:
@@ -126,24 +140,67 @@ def _circular_layout(nodes: Sequence[str], radius: float = 2.5) -> Dict[str, Tup
     return positions
 
 
-def _compute_positions(nodes: Sequence[str]) -> Dict[str, Tuple[float, float]]:
-    """Get plotting coordinates based on predefined manual positions."""
-    manual_positions = _manual_positions()
-    positions = {node: manual_positions[node] for node in nodes if node in manual_positions}
+def _compute_positions(nodes: Sequence[str], coord_map: Mapping[str, Tuple[float, float]]) -> Dict[str, Tuple[float, float]]:
+    """Derive 2-D positions from geographic coordinates for schematic plotting."""
+    available = {node: coord_map[node] for node in nodes if node in coord_map}
+    if not available:
+        return _circular_layout(nodes)
+    eastings = np.array([coord[0] for coord in available.values()], dtype=np.float32)
+    northings = np.array([coord[1] for coord in available.values()], dtype=np.float32)
+    min_e, max_e = float(eastings.min()), float(eastings.max())
+    min_n, max_n = float(northings.min()), float(northings.max())
+    width = max(max_e - min_e, 1.0)
+    height = max(max_n - min_n, 1.0)
+    positions: Dict[str, Tuple[float, float]] = {}
+    for node in nodes:
+        coord = coord_map.get(node)
+        if coord is None:
+            continue
+        x_norm = ((coord[0] - min_e) / width) * 2.0 - 1.0
+        y_norm = ((coord[1] - min_n) / height) * 2.0 - 1.0
+        positions[node] = (x_norm, y_norm)
     missing = [node for node in nodes if node not in positions]
     if missing:
-        positions.update(_circular_layout(missing))
+        positions.update(_circular_layout(missing, radius=1.3))
     return positions
 
 
+def _asset_category(asset: str) -> str:
+    snapshot = _network_snapshot()
+    return snapshot["category_map"].get(asset, "unclassified")
+
+
 def _categorize_asset(asset: str) -> str:
-    """Return the display category for the requested asset."""
-    return ASSET_TYPE_MAP.get(asset, "Unclassified")
+    """Return the display category label for the requested asset."""
+    category = _asset_category(asset)
+    return CATEGORY_LABELS.get(category, DEFAULT_CATEGORY_LABEL)
+
+
+def _asset_color(asset: str) -> str:
+    category = _asset_category(asset)
+    return CATEGORY_COLORS.get(category, CATEGORY_COLORS["unclassified"])
 
 
 def _asset_coordinate_map() -> Dict[str, Tuple[float, float]]:
     """Return a mapping of asset -> (Easting, Northing) coordinates."""
-    return dict(BASE_ASSET_COORDINATES)
+    snapshot = _network_snapshot()
+    return dict(snapshot["coordinates"])
+
+
+def _county_coordinate_map() -> Dict[str, Tuple[float, float]]:
+    snapshot = _network_snapshot()
+    return dict(snapshot.get("county_coordinates", {}))
+
+
+def _asset_county_links() -> Dict[str, Tuple[str, ...]]:
+    snapshot = _network_snapshot()
+    return {asset: tuple(counties) for asset, counties in snapshot.get("asset_counties", {}).items()}
+
+
+def _county_display_name(county_key: str) -> str:
+    snapshot = _network_snapshot()
+    display_map: Mapping[str, str] = snapshot.get("county_display_names", {})
+    return display_map.get(county_key, county_key.replace("_", " "))
 
 
 def _map_extent(coords: Mapping[str, Tuple[float, float]]) -> Tuple[float, float, float, float]:
@@ -183,13 +240,40 @@ def _add_dem_basemap(
     coord_map: Mapping[str, Tuple[float, float]],
     *,
     dem_path: Path | None = DEFAULT_DEM_PATH,
+    background_image: Path | None = DEFAULT_BACKGROUND_IMAGE,
 ) -> Tuple[Tuple[float, float, float, float], plt.AxesImage | None]:
-    """Add a DEM background plus satellite imagery to mirror the c_hand example."""
+    """Draw the requested background (image and/or DEM) and frame the axes."""
     extent = _map_extent(coord_map)
     xmin, xmax, ymin, ymax = extent
     crs_to_use = ASSET_COORD_CRS
     dem_image: plt.AxesImage | None = None
+    background_drawn = False
 
+    if background_image is not None:
+        try:
+            bg_extent, _, _ = _add_image_background(
+                ax,
+                coord_map,
+                image_path=Path(background_image),
+                cmap=None,
+                alpha=0.95,
+                mask_zero=False,
+            )
+            extent = bg_extent
+            xmin, xmax, ymin, ymax = extent
+            background_drawn = True
+        except FileNotFoundError as exc:
+            warnings.warn(
+                f"Background image not found ({exc}).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"Failed to load background image {background_image} ({exc}).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     if dem_path is not None:
         try:
             dem, profile = _load_dem(dem_path)
@@ -219,7 +303,7 @@ def _add_dem_basemap(
                 RuntimeWarning,
                 stacklevel=2,
             )
-    if cx is not None:
+    if not background_drawn and cx is not None:
         try:
             cx.add_basemap(
                 ax,
@@ -236,7 +320,7 @@ def _add_dem_basemap(
                 stacklevel=2,
             )
             ax.set_facecolor("#dcdcdc")
-    else:
+    elif not background_drawn:
         warnings.warn(
             "contextily not available; using DEM-only background.",
             RuntimeWarning,
@@ -249,23 +333,87 @@ def _add_dem_basemap(
     return extent, dem_image
 
 
+def _load_georeferenced_image(image_path: Path) -> Tuple[np.ndarray, Tuple[float, float, float, float], Dict[str, object]] | None:
+    """Return pixel data and extent if the path references a georeferenced raster."""
+    try:
+        with rio.open(image_path) as dataset:
+            data = dataset.read(out_dtype=np.float32)
+            profile = dataset.profile
+            transform = profile.get("transform")
+            if transform is None:
+                return None
+    except (RasterioIOError, ValueError):
+        return None
+
+    # Move band axis to the end for RGB/A rasters
+    processed: np.ndarray
+    if data.ndim == 3:
+        if data.shape[0] == 1:
+            processed = data[0]
+        elif data.shape[0] in (3, 4):
+            processed = np.moveaxis(data, 0, -1)
+        else:
+            processed = data[0]
+    else:
+        processed = data
+
+    nodata = profile.get("nodata")
+    if nodata is not None:
+        processed = np.where(processed == nodata, np.nan, processed)
+
+    extent = plotting_extent(data[0], transform)
+    return processed, extent, profile
+
+
 def _add_image_background(
     ax: plt.Axes,
     coord_map: Mapping[str, Tuple[float, float]],
     *,
     image_path: Path,
-) -> Tuple[float, float, float, float]:
+    cmap: str | None = None,
+    alpha: float = 0.95,
+    mask_zero: bool = True,
+) -> Tuple[Tuple[float, float, float, float], plt.AxesImage | None, Dict[str, object] | None]:
     """Use a pre-rendered image as the basemap background."""
-    extent = _map_extent(coord_map)
     if not image_path.exists():
         raise FileNotFoundError(f"Background image not found at {image_path}.")
+
+    georas = _load_georeferenced_image(image_path)
+    if georas is not None:
+        image_data, extent, profile = georas
+        xmin, xmax, ymin, ymax = extent
+
+        if mask_zero and image_data.ndim == 2:
+            image_data = image_data.copy()
+            image_data[np.isclose(image_data, 0.0)] = np.nan
+
+        artist = ax.imshow(
+            image_data,
+            extent=extent,
+            zorder=0,
+            cmap=None if image_data.ndim == 3 else (cmap or "viridis"),
+            alpha=alpha,
+        )
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+        ax.set_aspect("equal")
+        return extent, artist, profile
+
+    warnings.warn(
+        f"Background image {image_path} does not contain geospatial metadata; aligning using asset extent."
+        " The overlay may be misaligned. Prefer supplying a GeoTIFF.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+    extent = _map_extent(coord_map)
     img = mpimg.imread(image_path)
     xmin, xmax, ymin, ymax = extent
-    img_artist = ax.imshow(img, extent=extent, zorder=0)
+    artist = ax.imshow(img, extent=extent, zorder=0, alpha=alpha)
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
     ax.set_aspect("equal")
-    return extent, img_artist
+    return extent, artist, None
 
 
 def _draw_geographic_network(
@@ -283,7 +431,10 @@ def _draw_geographic_network(
     label_text_color: str = "black",
     node_label_color: str = "black",
     colored_arrows: bool = False,
-    arrow_outline_color: str = "#101010",
+    arrow_outline_color: str = "#1f1f1f",
+    label_offset: float = 2000.0,
+    label_fontsize: float = 7.5,
+    node_size: float = 140.0,
 ) -> Dict[str, Line2D]:
     """Draw dependency edges and nodes using real-world coordinates."""
     missing_assets: set[str] = set()
@@ -298,19 +449,29 @@ def _draw_geographic_network(
             if end_coord is None:
                 missing_assets.add(end)
             continue
-        start_asset_type = _categorize_asset(start)
-        start_color = ASSET_TYPE_COLORS.get(start_asset_type, ASSET_TYPE_COLORS["Unclassified"])
-        arrow_kwargs = dict(
-            linewidth=edge_linewidth,
-            shrinkA=6,
-            shrinkB=20,
-            mutation_scale=4,
-            alpha=edge_alpha,
-            width = 1.5,
-            headwidth = 5,
-            headlength = 5,
-        )
-        arrow_kwargs["color"] = start_color if colored_arrows else edge_color
+        start_color = edge_color
+        if colored_arrows:
+            arrow_kwargs = dict(
+                arrowstyle="-|>",
+                linewidth=edge_linewidth,
+                shrinkA=4,
+                shrinkB=10,
+                mutation_scale=12,
+                alpha=edge_alpha,
+                color="#ffffff",
+                joinstyle="miter",
+            )
+        else:
+            arrow_kwargs = dict(
+                arrowstyle="-|>",
+                linewidth=edge_linewidth,
+                shrinkA=4,
+                shrinkB=10,
+                mutation_scale=12,
+                alpha=edge_alpha,
+                color=edge_color,
+                joinstyle="miter",
+            )
         ax.annotate(
             "",
             xy=end_coord,
@@ -349,27 +510,34 @@ def _draw_geographic_network(
             missing_assets.add(node)
             continue
         asset_type = _categorize_asset(node)
-        color = ASSET_TYPE_COLORS.get(asset_type, ASSET_TYPE_COLORS["Unclassified"])
+        color = _asset_color(node)
         ax.scatter(
             [coord[0]],
             [coord[1]],
-            s=160,
+            s=node_size,
             color=color,
             edgecolors="#0f0f0f",
             linewidths=1.1,
             zorder=4,
         )
-        label_x, label_y = coord
-        if node == "Compressor1":
-            label_y += 2500.0
+
+        if label_offset > 0.0:
+            angle = (abs(hash(node)) % 3600) / 3600.0 * 2.0 * math.pi
+            dx = label_offset * math.cos(angle)
+            dy = label_offset * math.sin(angle)
+        else:
+            dx = dy = 0.0
+        ha = "left" if dx >= 0 else "right"
+        va = "bottom" if dy >= 0 else "top"
         text = ax.text(
-            label_x,
-            label_y,
+            coord[0] + dx,
+            coord[1] + dy,
             node,
-            fontsize=9,
-            ha="left",
-            va="bottom",
+            fontsize=label_fontsize,
+            ha=ha,
+            va=va,
             color=node_label_color,
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.78, linewidth=0.0),
             zorder=5,
         )
         text.set_path_effects([patheffects.withStroke(linewidth=2.6, foreground="white")])
@@ -457,7 +625,7 @@ def _draw_network_overlay(
             missing_assets.add(node)
             continue
         asset_type = _categorize_asset(node)
-        color = ASSET_TYPE_COLORS.get(asset_type, ASSET_TYPE_COLORS["Unclassified"])
+        color = _asset_color(node)
         ax.scatter(
             [coord[0]],
             [coord[1]],
@@ -500,6 +668,112 @@ def _draw_network_overlay(
     return missing_assets
 
 
+def _draw_county_connections(
+    ax: plt.Axes,
+    nodes: Sequence[str],
+    coord_map: Mapping[str, Tuple[float, float]],
+    *,
+    county_positions: Mapping[str, Tuple[float, float]] | None = None,
+    connection_color: str = "#6a51a3",
+    connection_linestyle: str = "-",
+    connection_alpha: float = 0.55,
+    connection_linewidth: float = 1.2,
+    county_marker: str = "s",
+    county_color: str = "#feb24c",
+    county_edgecolor: str = "#6a51a3",
+    county_marker_size: float = 88.0,
+    county_label_fontsize: float = 7.0,
+    county_label_color: str = "#202020",
+    county_label_offset: float = 2400.0,
+) -> Dict[str, Line2D]:
+    """Overlay county centroids and draw connections to served assets."""
+    county_coords = dict(county_positions) if county_positions is not None else _county_coordinate_map()
+    asset_counties = _asset_county_links()
+    connection_color = "#1f1f1f"
+    if not county_coords or not asset_counties:
+        return {}
+
+    counties_to_plot: Dict[str, Tuple[float, float]] = {}
+    for asset in nodes:
+        for county_key in asset_counties.get(asset, ()):  # type: ignore[arg-type]
+            coord = county_coords.get(county_key)
+            if coord is not None:
+                counties_to_plot[county_key] = coord
+
+    if not counties_to_plot:
+        return {}
+
+    # Draw connections before markers so nodes appear on top
+    for asset in nodes:
+        asset_coord = coord_map.get(asset)
+        if asset_coord is None:
+            continue
+        for county_key in asset_counties.get(asset, ()):  # type: ignore[arg-type]
+            county_coord = counties_to_plot.get(county_key)
+            if county_coord is None:
+                continue
+            ax.annotate(
+                "",
+                xy=county_coord,
+                xytext=asset_coord,
+                arrowprops=dict(
+                    arrowstyle="-|>",
+                    color=connection_color,
+                    linewidth=connection_linewidth,
+                    alpha=connection_alpha,
+                    shrinkA=6,
+                    shrinkB=14,
+                    mutation_scale=10,
+                    linestyle=connection_linestyle,
+                ),
+                zorder=2.2,
+            )
+
+    for county_key, coord in counties_to_plot.items():
+        ax.scatter(
+            [coord[0]],
+            [coord[1]],
+            marker=county_marker,
+            s=county_marker_size,
+            color=county_color,
+            edgecolors=county_edgecolor,
+            linewidths=0.9,
+            zorder=3.6,
+        )
+        if county_label_offset > 0.0:
+            angle = (abs(hash((county_key, "county"))) % 3600) / 3600.0 * 2.0 * math.pi
+            dx = county_label_offset * math.cos(angle)
+            dy = county_label_offset * math.sin(angle)
+        else:
+            dx = dy = 0.0
+        ha = "left" if dx >= 0 else "right"
+        va = "bottom" if dy >= 0 else "top"
+        ax.text(
+            coord[0] + dx,
+            coord[1] + dy,
+            _county_display_name(county_key),
+            fontsize=county_label_fontsize,
+            ha=ha,
+            va=va,
+            color=county_label_color,
+            bbox=dict(boxstyle="round,pad=0.18", facecolor="#ffffff", alpha=0.72, linewidth=0.0),
+            zorder=3.8,
+        )
+
+    return {
+        "County": Line2D(
+            [0],
+            [0],
+            marker=county_marker,
+            color="w",
+            markerfacecolor=county_color,
+            markeredgecolor=county_edgecolor,
+            markersize=6,
+            linewidth=0.0,
+        )
+    }
+
+
 def plot_asset_dependency_network(
     *,
     ax: plt.Axes | None = None,
@@ -509,17 +783,152 @@ def plot_asset_dependency_network(
     include_map: bool = True,
     dem_path: str | Path | None = DEFAULT_DEM_PATH,
     background_image: str | Path | None = DEFAULT_BACKGROUND_IMAGE,
-    colored_arrows: bool = True,
+    colored_arrows: bool = False,
+    plot_loads: bool = True,
+    population_heatmap: bool = False,
+    industrial_heatmap: bool = False,
+    background_cmap: str | None = "Blues",
+    background_alpha: float = 0.9,
+    background_colorbar_label: str | None = "Inundation depth [m]",
+    background_zero_transparent: bool = True,
+    show_counties: bool = True,
 ) -> Tuple[plt.Figure, plt.Axes]:
-    """Plot asset dependencies and optionally overlay geographic locations on a map."""
+    """Plot asset dependencies and optionally overlay geographic locations on a map.
+
+    Parameters
+    ----------
+    background_image:
+        Path to a background raster (GeoTIFF recommended) used for the secondary map figure.
+        Images without geospatial metadata fall back to the asset extent and may appear misaligned.
+    background_cmap:
+        Colormap applied to single-band rasters when rendering ``background_image``.
+    background_alpha:
+        Opacity applied to the background raster.
+    background_colorbar_label:
+        Label for the background colorbar; set to ``None`` to disable.
+    background_zero_transparent:
+        Treat zero-valued pixels in single-band backgrounds as transparent to expose the basemap.
+    show_counties:
+        Draw county centroids and highlight their service connections to substations and compressors.
+    """
     dependency_map = _dependency_map()
     nodes = _collect_assets(dependency_map)
-    edges = [
-        (dependency, asset)
-        for asset, dependencies in dependency_map.items()
-        for dependency in dependencies
-    ]
+    edges = list(_edge_list())
     edge_labels = _edge_labels()
+    coord_map_full = _asset_coordinate_map()
+    snapshot_full = _network_snapshot()
+
+    def _create_load_figure() -> plt.Figure | None:
+        components_info = snapshot_full["components"].values()
+        compressor_components = [cfg for cfg in components_info if cfg.category == "compressor"]
+        substation_components = [cfg for cfg in components_info if cfg.category == "substation"]
+        if not compressor_components and not substation_components:
+            return None
+
+        fig_load, axes = plt.subplots(1, 2, figsize=(12, 5))
+        if not isinstance(axes, np.ndarray):
+            axes = np.array([axes])
+        axes = axes.reshape(1, -1)
+
+        def _plot_panel(ax: plt.Axes, comps, supply_map, residential_map, industrial_map, title: str) -> None:
+            if not comps:
+                ax.axis("off")
+                ax.set_title(f"{title}\n(no data)")
+                return
+            names = [cfg.name for cfg in comps]
+            idx = np.arange(len(names))
+            width = 0.35
+            residential_vals = np.array([residential_map.get(name, 0.0) for name in names]) / 1e3
+            industrial_vals = np.array([industrial_map.get(name, 0.0) for name in names]) / 1e3
+            supply_vals = np.array([supply_map.get(name, 0.0) for name in names])
+            ax.bar(idx - width / 2, residential_vals, width=width, label="Residential (×10³)", color="#74add1")
+            ax.bar(idx + width / 2, industrial_vals, width=width, label="Industrial (×10³)", color="#fdae61")
+            for i, supply in enumerate(supply_vals):
+                ax.text(
+                    idx[i],
+                    max(residential_vals[i], industrial_vals[i]) + 0.05,
+                    f"{supply:.0f} MW",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                )
+            ax.set_xticks(idx)
+            ax.set_xticklabels(names, rotation=45, ha="right")
+            ax.set_ylabel("Weighted load (thousands)")
+            ax.set_title(title)
+            ax.legend(fontsize=8)
+
+        _plot_panel(
+            axes[0, 0],
+            compressor_components,
+            snapshot_full.get("compressor_supply", {}),
+            snapshot_full.get("compressor_residential", {}),
+            snapshot_full.get("compressor_industrial", {}),
+            "Compressor loads",
+        )
+        _plot_panel(
+            axes[0, 1],
+            substation_components,
+            snapshot_full.get("substation_supply", {}),
+            snapshot_full.get("substation_residential", {}),
+            snapshot_full.get("substation_industrial", {}),
+            "Substation loads",
+        )
+        fig_load.tight_layout()
+        return fig_load
+
+    def _create_heatmap_figure(weight_attr: str, title: str, cmap: str) -> plt.Figure | None:
+        coords = []
+        weights = []
+        for name, cfg in snapshot_full["components"].items():
+            if cfg.category not in {"compressor", "substation"}:
+                continue
+            coord = coord_map_full.get(name)
+            if coord is None:
+                continue
+            weight = getattr(cfg, weight_attr, 0.0)
+            if not weight:
+                continue
+            coords.append(coord)
+            weights.append(float(weight))
+        if not coords:
+            return None
+        extent = _map_extent(coord_map_full)
+        xmin, xmax, ymin, ymax = extent
+        xs = np.array([c[0] for c in coords])
+        ys = np.array([c[1] for c in coords])
+        fig_heat, ax_heat = plt.subplots(figsize=(10, 10))
+        hb = ax_heat.hexbin(
+            xs,
+            ys,
+            C=np.array(weights, dtype=np.float64),
+            gridsize=40,
+            extent=extent,
+            cmap=cmap,
+            reduce_C_function=np.sum,
+            mincnt=1,
+            linewidths=0.0,
+            alpha=0.85,
+        )
+        ax_heat.set_xlim(xmin, xmax)
+        ax_heat.set_ylim(ymin, ymax)
+        ax_heat.set_xlabel("Easting [m]")
+        ax_heat.set_ylabel("Northing [m]")
+        ax_heat.set_title(title)
+        fig_heat.colorbar(hb, ax=ax_heat, label="Weighted density")
+        _draw_geographic_network(
+            ax_heat,
+            nodes,
+            edges,
+            edge_labels,
+            coord_map_full,
+            colored_arrows=colored_arrows,
+            edge_linewidth=1.0,
+            edge_color="#2b2b2b",
+            edge_alpha=0.6,
+        )
+        fig_heat.tight_layout()
+        return fig_heat
 
     secondary_fig: plt.Figure | None = None
 
@@ -531,9 +940,21 @@ def plot_asset_dependency_network(
     else:
         fig = ax.figure
 
+    secondary_fig: plt.Figure | None = None
+    load_fig: plt.Figure | None = None
+    residential_fig: plt.Figure | None = None
+    industrial_fig: plt.Figure | None = None
+
     if include_map:
-        coord_map_full = _asset_coordinate_map()
         relevant_coords = {node: coord_map_full[node] for node in nodes if node in coord_map_full}
+        county_coords_full = _county_coordinate_map()
+        asset_counties = _asset_county_links()
+        if show_counties:
+            for asset in nodes:
+                for county_key in asset_counties.get(asset, ()):  # type: ignore[arg-type]
+                    county_coord = county_coords_full.get(county_key)
+                    if county_coord is not None:
+                        relevant_coords.setdefault(f"county::{county_key}", county_coord)
         if not relevant_coords:
             raise ValueError("No geographic coordinates available for the requested assets.")
         dem_param = Path(dem_path) if dem_path is not None else None
@@ -549,6 +970,12 @@ def plot_asset_dependency_network(
             cbar.ax.tick_params(labelsize=9)
 
         coord_map = coord_map_full
+        if plot_loads:
+            load_fig = _create_load_figure()
+        if population_heatmap:
+            residential_fig = _create_heatmap_figure("residential_load", "Residential load density", "YlGnBu")
+        if industrial_heatmap:
+            industrial_fig = _create_heatmap_figure("industrial_load", "Industrial load density", "YlOrRd")
         legend_handles = _draw_geographic_network(
             ax,
             nodes,
@@ -558,6 +985,15 @@ def plot_asset_dependency_network(
             colored_arrows=colored_arrows,
             arrow_outline_color="#101010",
         )
+
+        if show_counties:
+            county_handles = _draw_county_connections(
+                ax,
+                nodes,
+                coord_map,
+            )
+            if county_handles:
+                legend_handles.update(county_handles)
 
         if legend_handles:
             ax.legend(
@@ -571,13 +1007,34 @@ def plot_asset_dependency_network(
             image_param = Path(background_image)
             try:
                 fig_img, ax_img = plt.subplots(figsize=(10, 10))
-                _add_image_background(ax_img, relevant_coords, image_path=image_param)
+                _, img_artist, img_profile = _add_image_background(
+                    ax_img,
+                    relevant_coords,
+                    image_path=image_param,
+                    cmap=background_cmap,
+                    alpha=background_alpha,
+                    mask_zero=background_zero_transparent,
+                )
                 ax_img.set_xlabel("Easting [m]")
                 ax_img.set_ylabel("Northing [m]")
                 if subplot_title:
                     ax_img.set_title(f"{subplot_title} (image background)", fontsize=13)
                 else:
                     ax_img.set_title("Asset Dependency Map (image background)")
+
+                if (
+                    background_colorbar_label
+                    and img_artist is not None
+                    and img_profile is not None
+                    and getattr(img_artist.get_array(), "ndim", 0) == 2
+                ):
+                    fig_img.colorbar(
+                        img_artist,
+                        ax=ax_img,
+                        shrink=0.8,
+                        label=background_colorbar_label,
+                    )
+
                 legend_img = _draw_geographic_network(
                     ax_img,
                     nodes,
@@ -594,10 +1051,20 @@ def plot_asset_dependency_network(
                     colored_arrows=colored_arrows,
                     arrow_outline_color="#f5f5f5",
                 )
-                if legend_img:
+                county_img_handles: Dict[str, Line2D] = {}
+                if show_counties:
+                    county_img_handles = _draw_county_connections(
+                        ax_img,
+                        nodes,
+                        coord_map,
+                    )
+                combined_handles = dict(legend_img)
+                if county_img_handles:
+                    combined_handles.update(county_img_handles)
+                if combined_handles:
                     ax_img.legend(
-                        legend_img.values(),
-                        legend_img.keys(),
+                        combined_handles.values(),
+                        combined_handles.keys(),
                         title="Asset Type",
                         loc="upper left",
                     )
@@ -611,12 +1078,34 @@ def plot_asset_dependency_network(
                 )
                 secondary_fig = None
     else:
-        positions = _compute_positions(nodes)
+        county_coords_full = _county_coordinate_map()
+        asset_counties = _asset_county_links() if show_counties else {}
+        county_nodes: set[str] = set()
+        if show_counties:
+            for asset in nodes:
+                for county_key in asset_counties.get(asset, ()):  # type: ignore[arg-type]
+                    if county_key in county_coords_full:
+                        county_nodes.add(county_key)
+
+        layout_nodes = list(nodes)
+        layout_coord_map = dict(coord_map_full)
+        if show_counties:
+            for county_key in county_nodes:
+                layout_nodes.append(county_key)
+                layout_coord_map[county_key] = county_coords_full[county_key]
+
+        positions = _compute_positions(layout_nodes, layout_coord_map)
         ax.set_aspect("equal")
         ax.axis("off")
         ax.margins(0.2)
         if subplot_title:
             ax.set_title(subplot_title, fontsize=13)
+        if plot_loads:
+            load_fig = _create_load_figure()
+        if population_heatmap:
+            residential_fig = _create_heatmap_figure("residential_load", "Residential load density", "YlGnBu")
+        if industrial_heatmap:
+            industrial_fig = _create_heatmap_figure("industrial_load", "Industrial load density", "YlOrRd")
 
         for start, end in edges:
             x0, y0 = positions[start]
@@ -662,7 +1151,7 @@ def plot_asset_dependency_network(
         for node in nodes:
             x, y = positions[node]
             asset_type = _categorize_asset(node)
-            color = ASSET_TYPE_COLORS.get(asset_type, ASSET_TYPE_COLORS["Unclassified"])
+            color = _asset_color(node)
             ax.scatter(
                 [x],
                 [y],
@@ -693,6 +1182,17 @@ def plot_asset_dependency_network(
                     markersize=9,
                     linewidth=0.0,
                 )
+        if show_counties and county_nodes:
+            asset_position_map = {name: positions[name] for name in nodes}
+            county_position_map = {name: positions[name] for name in county_nodes if name in positions}
+            county_handles = _draw_county_connections(
+                ax,
+                nodes,
+                asset_position_map,
+                county_positions=county_position_map,
+            )
+            if county_handles:
+                legend_handles.update(county_handles)
         if legend_handles:
             ax.legend(
                 legend_handles.values(),
@@ -708,6 +1208,19 @@ def plot_asset_dependency_network(
         fig._secondary_map_figure = secondary_fig
         if secondary_fig is not None:
             secondary_fig._primary_map_figure = fig
+    if plot_loads:
+        fig._load_distribution_figure = load_fig
+        if load_fig is not None:
+            load_fig._primary_network_figure = fig
+    if population_heatmap:
+        fig._residential_heatmap_figure = residential_fig
+        fig._population_heatmap_figure = residential_fig
+        if residential_fig is not None:
+            residential_fig._primary_network_figure = fig
+    if industrial_heatmap:
+        fig._industrial_heatmap_figure = industrial_fig
+        if industrial_fig is not None:
+            industrial_fig._primary_network_figure = fig
     if save_path is not None:
         save_path_obj = Path(save_path)
     else:
@@ -728,10 +1241,33 @@ def plot_asset_dependency_network(
         else:
             secondary_path = Path(f"{primary_path}_image")
         secondary_fig.savefig(secondary_path, bbox_inches="tight")
+    if plot_loads and load_fig is not None:
+        if primary_path.suffix:
+            loads_path = primary_path.with_name(f"{primary_path.stem}_loads{primary_path.suffix}")
+        else:
+            loads_path = Path(f"{primary_path}_loads")
+        load_fig.savefig(loads_path, bbox_inches="tight")
+    if population_heatmap and residential_fig is not None:
+        if primary_path.suffix:
+            pop_path = primary_path.with_name(f"{primary_path.stem}_residential{primary_path.suffix}")
+        else:
+            pop_path = Path(f"{primary_path}_residential")
+        residential_fig.savefig(pop_path, bbox_inches="tight")
+    if industrial_heatmap and industrial_fig is not None:
+        if primary_path.suffix:
+            ind_path = primary_path.with_name(f"{primary_path.stem}_industrial{primary_path.suffix}")
+        else:
+            ind_path = Path(f"{primary_path}_industrial")
+        industrial_fig.savefig(ind_path, bbox_inches="tight")
     if show:
         plt.show()
     return fig, ax
 
 
 if __name__ == "__main__":
-    plot_asset_dependency_network()
+    plot_asset_dependency_network(
+    include_map=True,
+    population_heatmap=False,
+    industrial_heatmap=False,
+    save_path="Images/network.png",
+)
