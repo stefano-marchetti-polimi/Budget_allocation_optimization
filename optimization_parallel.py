@@ -541,7 +541,7 @@ def main():
 
     # ---------- Vectorization & batching ----------
     cpu_count = os.cpu_count()
-    n_envs = min(max(6, cpu_count - 2), 12) 
+    n_envs = min(max(6, cpu_count - 2), 24) 
 
     # Rollout length per env; total batch = n_envs * n_steps
     n_steps = 2048
@@ -550,7 +550,7 @@ def main():
     batch_size = math.gcd(total_batch, target_bs)  # clean divisor
 
     n_epochs = 5
-    device = "cpu"  # try "mps" and compare wall-clock if your net is large
+    device = "cuda"  # try "mps" and compare wall-clock if your net is large
 
     policy_kwargs = dict(
     net_arch=dict(pi=[128, 128], vf=[128,128]),  # vf is critic
