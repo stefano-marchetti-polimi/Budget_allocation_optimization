@@ -550,7 +550,7 @@ def main():
     batch_size = math.gcd(total_batch, target_bs)  # clean divisor
 
     n_epochs = 5
-    device = "cuda"  # try "mps" and compare wall-clock if your net is large
+    device = "cpu"  # try "mps" and compare wall-clock if your net is large
 
     policy_kwargs = dict(
     net_arch=dict(pi=[128, 128], vf=[128,128]),  # vf is critic
