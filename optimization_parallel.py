@@ -27,7 +27,7 @@ _NETWORK_CONFIG = _build_default_network(PROJECT_ROOT / "data")
 num_nodes = len(_NETWORK_CONFIG.components)
 years = 75 # until 2100
 year_step = 5 # 15 decisions
-RL_steps = 30000000
+RL_steps = 20000000
 learning_rate = 5e-4
 
 # Per-asset footprint areas (m^2)
