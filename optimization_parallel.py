@@ -20,14 +20,14 @@ from utils.environment import TrialEnv, _build_default_network  # must be import
 SCENARIO_NAME = "random"  # decision-maker preferences (neutral, gas-economic, gas-social, electricity-economic, electricity-social, All, random)
 CLIMATE_SCENARIO = "All"  # sea level rise projections (SSP1-1.9, SSP1-2.6, SSP2-4.5, SSP3-7.0, SSP5-8.5, All)
 BUDGET = 500000
-MC_SAMPLES = 10000
+MC_SAMPLES = 5000
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 _NETWORK_CONFIG = _build_default_network(PROJECT_ROOT / "data")
 num_nodes = len(_NETWORK_CONFIG.components)
 years = 75 # until 2100
 year_step = 5 # 15 decisions
-RL_steps = 50000000
+RL_steps = 30000000
 learning_rate = 5e-4
 
 # Per-asset footprint areas (m^2)
